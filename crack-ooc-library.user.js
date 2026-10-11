@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Crack OOC 보관함
 // @namespace    crack.ooc.library
-// @version      3.0.0.0
+// @version      3.0.1.0
 // @description  OOC를 보관하고 안전한 assistant carrier에 독립적으로 자동 컨텍스트를 주입 (version 관리방식: 데이터구조버전.크랙UI변경.기능추가및수정.버그수정)
 // @match        https://crack.wrtn.ai/*
 // @noframes
@@ -21,16 +21,16 @@
  * - 자동주입 조건이 하나(conditionType/conditionValue)에서 여러 개(autoInjection.conditions[], 모두 만족해야 하는 AND)로 바뀌었다.
  *   조건이 없으면 "항상"이다. schemaVersion 2 자료는 읽을 때 조건 하나짜리 배열로 옮기고 다음 저장 때 3으로 기록한다.
  *   2.x 스크립트는 conditions[]를 모르고 "항상"으로 읽어 버리므로, 잘못 주입되지 않게 schemaVersion을 올려 2.x가 이 자료를 거부하게 했다.
- *   같은 Firebase/백업을 쓰는 다른 기기도 3.x로 올려야 한다.
+ *   같은 Firebase 자료를 쓰는 다른 기기도 3.x로 올려야 한다.
  * - 조건 유형: model, assistantLength, keyword, situation(상황 감지 API). 이 버전이 모르는 유형은 지우지 않고 "맞지 않음"으로 다룬다.
- * - 상황 감지 API 설정(API key, Firebase config)은 이 자료에 넣지 않는다. 브라우저 localStorage에만 두며 백업·동기화·진단에 싣지 않는다.
+ * - 상황 감지 API 설정(API key, Firebase config)은 이 자료에 넣지 않는다. 브라우저 localStorage에만 두며 동기화·진단에 싣지 않는다.
  *
  * schemaVersion 2 이하에서 이어지는 규칙
  * - v1의 단일-key 카테고리/OOC 객체를 명시적 레코드로 이관한다.
  * - v1 자료는 읽는 즉시 메모리에서 최신 구조로 변환되며, 다음 저장 때 최신 버전으로 기록된다.
  * - 이관된 기존 OOC의 자동주입은 항상 OFF다.
  * - 구버전 호환: 1.x 스크립트는 schemaVersion 2 자료를 "데이터 형식이 올바르지 않습니다"로 거부한다.
- *   같은 Firebase/백업을 쓰는 다른 기기도 2.x로 올려야 읽을 수 있다 (조용한 자료 손실은 없다).
+ *   같은 Firebase 자료를 쓰는 다른 기기도 2.x로 올려야 읽을 수 있다 (조용한 자료 손실은 없다).
  * - autoSettings.wrmcCarrierMode는 2.0.2.0에서 추가됐다. 2.0.1.x가 저장하면 이 값만 빠지고 'auto'로 돌아간다.
  *
  * - 2.0.3.0: autoInjection.priority / injectionBody를 없앴다 (읽을 때 무시, 다음 저장 때 빠짐). 자동주입은 항상 content를 쓰고,
@@ -41,6 +41,9 @@
  * - 2.0.4.0: 조건 유형 'userLength'(USER 입력 글자수)를 없애고 'assistantLength'(AI 응답 글자수)를 넣었다. 뜻이 다르므로 예전
  *   userLength 항목은 조건값을 남긴 채 자동주입을 끄고 autoInjection.legacyCondition = 'userLength'로 "다시 확인 필요"를 표시한다
  *   (편집창에서 적용하면 표시가 사라진다). 2.0.3.x 이하는 assistantLength를 몰라 '항상'으로 읽으므로 같은 자료를 쓰는 기기는 함께 올려야 한다.
+ *
+ * - 3.0.1.0: 자료 구조는 그대로다. 상황 감지 API 설정에서 recentMessages / timeoutMs를 없앴다 (최근 메시지 6개, 3초로 고정).
+ *   localStorage에 남은 예전 값은 읽지 않고 다음 "API 설정 저장" 때 빠진다. 설정의 전체 백업/전체 복원(JSON 파일)을 없앴다.
  *
  * 자동 OOC (2.0.2.0)
  * - USER 메시지와 WebSocket payload는 읽기만 한다. 자동 OOC는 과거 assistant 메시지(carrier) 끝에
@@ -69,6 +72,8 @@
   const RESIDUE_MAX_AGE_MS = 14 * 24 * 60 * 60 * 1000;
   const CARRIER_SEARCH_DEPTH = 4;
   const SAMPLE_GENERATION_ID = '0'.repeat(36);
+  // 미리보기에서 generation id 자리에 넣는 값. 실제 id(UUID 36자)와 길이가 같아 글자수 계산이 실제 전송과 같다.
+  const PREVIEW_GENERATION_ID = 'PREVIEW_ONLY_NOT_A_REAL_GENERATION'.padEnd(36, '_');
   const WRMC_MODES = ['auto', 'always', 'never'];
   const RESIDUE_KEY = 'crack-ooc-library.auto-residues.v1';
   // 평가 순서이기도 하다: 값싼 로컬 조건을 먼저 보고 API가 필요한 상황 감지를 마지막에 본다.
@@ -76,7 +81,12 @@
   const MAX_CONDITIONS = 12;
   const SITUATION_KEY = 'crack-ooc-library.situation-api.v1';
   const SITUATION_PROVIDERS = ['off', 'google-ai-studio', 'firebase-vertex'];
-  const SITUATION_DEFAULTS = Object.freeze({ provider: 'off', googleModel: 'gemini-3.5-flash-lite', firebaseModel: 'gemini-3.5-flash-lite', firebaseLocation: 'global', recentMessages: 6, timeoutMs: 3000 });
+  // 상황 감지에 쓸 수 있는 모델. ids는 같은 모델을 가리키는 API 이름들이며 앞의 것부터 써 본다.
+  const SITUATION_MODELS = Object.freeze([{ label: '3.8 Flash', ids: ['gemini-3.8-flash'] }, { label: '3.1 Pro', ids: ['gemini-3.1-pro-preview', 'gemini-3.1-pro'] }]);
+  // 판정에 보내는 최근 메시지 수와 응답을 기다리는 시간. 설정으로 바꿀 수 없다.
+  const SITUATION_CONTEXT_MESSAGES = 6;
+  const SITUATION_TIMEOUT_MS = 3000;
+  const SITUATION_DEFAULTS = Object.freeze({ provider: 'off', googleModel: SITUATION_MODELS[0].ids[0], firebaseModel: SITUATION_MODELS[0].ids[0], firebaseLocation: 'global' });
   const MODEL_CACHE_KEY = 'crack-ooc-library.chat-models.v2';
   const MODEL_CACHE_MAX_AGE_MS = 6 * 60 * 60 * 1000;
   // Crack chat-models API가 받는 serviceType 값과 dropdown 묶음 이름.
@@ -365,6 +375,7 @@
   const contents = (data, category) => category < 0 ? data.extras : data.categories[category].items;
   const total = data => data.extras.length + data.categories.reduce((sum, item) => sum + item.items.length, 0);
   const allEntries = data => [...data.categories.flatMap(category => category.items), ...data.extras];
+  const autoActive = data => data.autoSettings.autoInjectionEnabled && allEntries(data).some(entry => entry.autoInjection.enabled);
 
   function parseLengthCondition(value) {
     const text = String(value || '').normalize('NFKC').trim().replace(/\s+/g, '');
@@ -508,7 +519,7 @@
     const maxChars = Math.max(0, Math.min(configured.autoOocMaxChars, Number.isFinite(requested) ? Math.trunc(requested) : configured.autoOocMaxChars));
     const overhead = Number.isFinite(Number(request.overhead)) ? Math.max(0, Number(request.overhead)) : autoRegionOverhead();
     const modelDetected = modelValues(request.model).length > 0;
-    if (!configured.autoInjectionEnabled || !['before-send', 'before-reroll', 'preview'].includes(request.reason) || maxChars <= 0) return { block: '', selected: [], matched: [], omitted: [], maxChars, chars: 0, modelDetected };
+    if (!configured.autoInjectionEnabled || !['before-send', 'before-reroll'].includes(request.reason) || maxChars <= 0) return { block: '', selected: [], matched: [], omitted: [], maxChars, chars: 0, modelDetected };
     const seen = new Set(), omitted = [], summary = row => ({ id: row.entry.id, name: row.entry.name, libraryOrder: row.order + 1 });
     const candidates = allEntries(data).map((entry, order) => ({ entry, order, rendered: renderAutoItem(entry) }))
       .filter(row => row.entry.autoInjection.enabled && row.rendered && entryMatches(row.entry, request))
@@ -754,7 +765,7 @@
   // ---------------------------------------------------------------------------
   // API는 "이 상황 조건이 지금 대화에 해당하는가"만 분류한다. OOC를 만들거나 고치지 않고, 무엇을 어떤 순서로 넣을지도 정하지 않는다.
   // 설정(API key, Firebase config)은 보관함 자료와 따로 이 브라우저의 localStorage에만 둔다.
-  // 백업 파일, Firebase 동기화, 진단, 콘솔 어디에도 싣지 않는다.
+  // Firebase 동기화, 진단, 콘솔 어디에도 싣지 않는다.
   // Firebase 콘솔의 `const firebaseConfig = { ... };`, 중괄호 객체만, JSON을 모두 받는다. 코드를 실행하지 않고 글자만 다듬어 JSON으로 읽는다.
   function parseFirebaseAppConfig(text) {
     let source = String(text ?? '').trim();
@@ -779,16 +790,15 @@
     return config;
   }
   const geminiModelId = value => String(value ?? '').trim().replace(/^models\//, '').slice(0, 100);
+  // 예전 설정에 남아 있을 수 있는 recentMessages / timeoutMs는 읽지 않는다 (고정값을 쓴다). 다음 저장 때 빠진다.
   function normalizeSituationSettings(value = {}) {
     const src = value && typeof value === 'object' && !Array.isArray(value) ? value : {}, text = (item, max = 300) => typeof item === 'string' ? item.trim().slice(0, max) : '';
-    const recent = Number(src.recentMessages), timeout = Number(src.timeoutMs), location = text(src.firebaseLocation, 40);
+    const location = text(src.firebaseLocation, 40);
     let firebaseConfig = null; try { if (src.firebaseConfig) firebaseConfig = parseFirebaseAppConfig(JSON.stringify(src.firebaseConfig)); } catch { /* 저장된 값이 깨졌으면 비운다. */ }
     return { provider: SITUATION_PROVIDERS.includes(src.provider) ? src.provider : SITUATION_DEFAULTS.provider,
       googleApiKey: text(src.googleApiKey), googleModel: geminiModelId(src.googleModel) || SITUATION_DEFAULTS.googleModel,
       firebaseConfig, firebaseModel: geminiModelId(src.firebaseModel) || SITUATION_DEFAULTS.firebaseModel,
-      firebaseLocation: /^[a-z0-9-]{2,40}$/.test(location) ? location : SITUATION_DEFAULTS.firebaseLocation, firebaseAppCheckDebugToken: text(src.firebaseAppCheckDebugToken),
-      recentMessages: Number.isFinite(recent) ? Math.max(2, Math.min(12, Math.trunc(recent))) : SITUATION_DEFAULTS.recentMessages,
-      timeoutMs: Number.isFinite(timeout) ? Math.max(1000, Math.min(6000, Math.trunc(timeout))) : SITUATION_DEFAULTS.timeoutMs };
+      firebaseLocation: /^[a-z0-9-]{2,40}$/.test(location) ? location : SITUATION_DEFAULTS.firebaseLocation, firebaseAppCheckDebugToken: text(src.firebaseAppCheckDebugToken) };
   }
   let situationSettings = normalizeSituationSettings();
   try { situationSettings = normalizeSituationSettings(JSON.parse(pageStorage.getItem(SITUATION_KEY) || 'null') || {}); } catch { /* 설정이 없으면 "사용 안 함"이다. */ }
@@ -816,7 +826,8 @@
       } catch (error) { done(reject, error); }
     });
   }
-  const apiErrorText = response => String(response?.data?.error?.message || response?.data?.error?.status || '').replace(/\s+/g, ' ').slice(0, 160);
+  // Google API의 오류 본문은 { error } 이거나 [{ error }] 이다.
+  const apiErrorText = response => { const error = (Array.isArray(response?.data) ? response.data[0] : response?.data)?.error; return String(error?.message || error?.status || '').replace(/\s+/g, ' ').slice(0, 160); };
   // Firebase App Check가 켜진 프로젝트용. 콘솔에서 만든 디버그 토큰을 App Check 토큰으로 바꿔 메모리에만 둔다.
   const appCheckTokens = new Map();
   async function appCheckToken(config, debugToken, signal, timeout) {
@@ -829,42 +840,74 @@
     appCheckTokens.set(key, { token, until: Date.now() + (ttl ? Number(ttl[1]) : 3600) * 1000 });
     return token;
   }
-  // 두 공급자 모두 Gemini generateContent 형식이다.
-  // - Google AI Studio: generativelanguage.googleapis.com/v1beta/models/{model}:generateContent, 헤더 x-goog-api-key
-  // - Firebase Vertex AI(Firebase AI Logic): firebasevertexai.googleapis.com/v1beta/projects/{projectId}/locations/{location}/publishers/google/models/{model}:generateContent,
-  //   헤더 x-goog-api-key = Firebase config의 apiKey
-  function situationEndpoint(settings) {
+  // 설정에서 고를 수 있는 모델은 SITUATION_MODELS의 둘뿐이다. 한 모델의 API 이름이 바뀌었을 때(미리보기 → 정식)를 대비해
+  // 후보 이름을 순서대로 써 보고, 마지막으로 응답한 이름을 이 페이지에서 기억한다.
+  const situationModelChoice = model => SITUATION_MODELS.find(choice => choice.ids.includes(model)) || null;
+  const workingSituationModels = new Map(), workingModelKey = (settings, choice) => `${settings.provider}:${choice.label}`;
+  function situationModelIds(settings, model) {
+    const choice = situationModelChoice(model); if (!choice) return [model];
+    const first = workingSituationModels.get(workingModelKey(settings, choice)) || model;
+    return [first, ...choice.ids.filter(id => id !== first)];
+  }
+  function situationTarget(settings) {
     if (settings.provider === 'google-ai-studio') {
       if (!settings.googleApiKey) throw situationError('no-api-key', 'Google AI Studio API Key가 없습니다.');
       const model = geminiModelId(settings.googleModel); if (!model) throw situationError('no-model', '모델 이름이 없습니다.');
-      return { model, config: null, headers: { 'Content-Type': 'application/json', 'x-goog-api-key': settings.googleApiKey },
-        url: `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent` };
+      return { model, config: null, headers: { 'Content-Type': 'application/json', 'x-goog-api-key': settings.googleApiKey } };
     }
     if (settings.provider === 'firebase-vertex') {
       const config = settings.firebaseConfig; if (!config) throw situationError('no-firebase-config', 'Firebase config가 없습니다.');
       const model = geminiModelId(settings.firebaseModel); if (!model) throw situationError('no-model', '모델 이름이 없습니다.');
-      return { model, config, headers: { 'Content-Type': 'application/json', 'x-goog-api-key': config.apiKey },
-        url: `https://firebasevertexai.googleapis.com/v1beta/projects/${encodeURIComponent(config.projectId)}/locations/${encodeURIComponent(settings.firebaseLocation)}/publishers/google/models/${encodeURIComponent(model)}:generateContent` };
+      return { model, config, headers: { 'Content-Type': 'application/json', 'x-goog-api-key': config.apiKey } };
     }
     throw situationError('off', '상황 감지 API가 "사용 안 함"입니다.');
   }
+  // 한 모델에 보낼 수 있는 요청 형식들을 써 볼 순서대로 돌려준다. 모두 짧은 JSON({ "matched": [...] })만 받도록 지정한다.
+  // - Google AI Studio: generativelanguage.googleapis.com, 헤더 x-goog-api-key.
+  //   3.7/3.8 Flash는 Interactions API(/v1beta/interactions)를 먼저, 그 밖에는 generateContent를 먼저 쓴다 (WRMC가 쓰는 구분과 같다).
+  // - Firebase Vertex AI(Firebase AI Logic): firebasevertexai.googleapis.com/v1beta/projects/{projectId}/locations/{location}/publishers/google/models/{model}:generateContent,
+  //   헤더 x-goog-api-key = Firebase config의 apiKey. 3.6~3.8 Flash는 global 위치에서만 부른다.
+  function situationRequests(settings, target, model, system, user) {
+    const generationText = data => { const candidate = data?.candidates?.[0]; return (candidate?.content?.parts || []).filter(part => !part?.thought).map(part => typeof part?.text === 'string' ? part.text : '').join('').trim(); };
+    const generate = (url, strict) => ({ model, url, read: generationText, body: { systemInstruction: { parts: [{ text: system }] }, contents: [{ role: 'user', parts: [{ text: user }] }],
+      // Gemini 3 계열은 기본 sampling을 그대로 두고 생각 단계를 낮게, 그 밖에는 temperature 0으로 둔다. schema·thinking 지정을 받지 않는 모델을 위해 느슨한 형식도 둔다.
+      generationConfig: strict ? { responseMimeType: 'application/json', maxOutputTokens: 1024, responseSchema: { type: 'OBJECT', properties: { matched: { type: 'ARRAY', items: { type: 'STRING' } } }, required: ['matched'] },
+        ...(/^gemini-3/.test(model) ? { thinkingConfig: { thinkingLevel: 'low' } } : { temperature: 0 }) } : { responseMimeType: 'application/json', maxOutputTokens: 1024 } } });
+    if (settings.provider === 'firebase-vertex') {
+      const location = /^gemini-3\.[678]-flash/.test(model) ? 'global' : settings.firebaseLocation;
+      const url = `https://firebasevertexai.googleapis.com/v1beta/projects/${encodeURIComponent(target.config.projectId)}/locations/${encodeURIComponent(location)}/publishers/google/models/${encodeURIComponent(model)}:generateContent`;
+      return [generate(url, true), generate(url, false)];
+    }
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`;
+    const interaction = { model, url: 'https://generativelanguage.googleapis.com/v1beta/interactions',
+      body: { model, input: user, store: false, system_instruction: system, generation_config: { max_output_tokens: 1024, thinking_level: 'low' },
+        response_format: { type: 'text', mime_type: 'application/json', schema: { type: 'object', properties: { matched: { type: 'array', items: { type: 'string' } } }, required: ['matched'] } } },
+      read: data => { if (/incomplete|failed|cancelled/i.test(String(data?.status || ''))) return ''; const output = (Array.isArray(data?.steps) ? data.steps : []).filter(step => step?.type === 'model_output').pop(); return (Array.isArray(output?.content) ? output.content : []).filter(part => part?.type === 'text').map(part => String(part.text || '')).join('').trim(); } };
+    return /^gemini-3\.[78]-flash/.test(model) ? [interaction, generate(url, true), generate(url, false)] : [generate(url, true), generate(url, false), interaction];
+  }
   async function situationModelText(settings, system, user, signal, deadline) {
-    const target = situationEndpoint(settings), headers = { ...target.headers }, left = () => deadline - Date.now();
+    const target = situationTarget(settings), headers = { ...target.headers }, left = () => deadline - Date.now(), choice = situationModelChoice(target.model);
     if (target.config && settings.firebaseAppCheckDebugToken) headers['X-Firebase-AppCheck'] = await appCheckToken(target.config, settings.firebaseAppCheckDebugToken, signal, left());
-    const base = { systemInstruction: { parts: [{ text: system }] }, contents: [{ role: 'user', parts: [{ text: user }] }] };
-    // 짧은 JSON만 받는다. Gemini 3 계열은 기본 sampling을 그대로 두고 생각 단계를 낮게, 그 밖에는 temperature 0으로 둔다.
-    const strict = { responseMimeType: 'application/json', maxOutputTokens: 1024,
-      responseSchema: { type: 'OBJECT', properties: { matched: { type: 'ARRAY', items: { type: 'STRING' } } }, required: ['matched'] },
-      ...(/^gemini-3/.test(target.model) ? { thinkingConfig: { thinkingLevel: 'low' } } : { temperature: 0 }) };
-    let response = await externalJson('POST', target.url, headers, { ...base, generationConfig: strict }, signal, left());
-    // 일부 모델은 schema·thinking 지정을 받지 않는다. 그런 400이면 JSON 출력 지정만 남기고 시간이 남을 때 한 번만 다시 보낸다.
-    if (response.status === 400 && !/api key/i.test(apiErrorText(response)) && left() > 500)
-      response = await externalJson('POST', target.url, headers, { ...base, generationConfig: { responseMimeType: 'application/json', maxOutputTokens: 1024 } }, signal, left());
-    if (response.status < 200 || response.status >= 300) throw situationError(`http-${response.status}`, `API가 요청을 받지 않았습니다 (HTTP ${response.status}${apiErrorText(response) ? ` · ${apiErrorText(response)}` : ''}).`);
-    const candidate = response.data?.candidates?.[0];
-    const text = (candidate?.content?.parts || []).filter(part => !part?.thought).map(part => typeof part?.text === 'string' ? part.text : '').join('').trim();
-    if (!text) throw situationError('empty', `모델이 답을 내지 않았습니다 (${String(response.data?.promptFeedback?.blockReason || candidate?.finishReason || '빈 응답').slice(0, 60)}).`);
-    return text;
+    // 써 볼 순서: 같은 요청 형식으로 모델 이름들을 먼저 돌고, 그다음 형식으로 넘어간다. 404를 준 주소는 다시 부르지 않는다.
+    const plans = situationModelIds(settings, target.model).map(model => situationRequests(settings, target, model, system, user)), queue = [];
+    for (let step = 0; step < 3; step++) for (const plan of plans) if (plan[step]) queue.push(plan[step]);
+    let last = null, tries = 0; const missing = new Set();
+    for (const request of queue) {
+      if (missing.has(request.url)) continue;
+      if (tries++ >= 4 || last && left() < 500) break;
+      const response = await externalJson('POST', request.url, headers, request.body, signal, left());
+      if (response.status >= 200 && response.status < 300) {
+        const text = request.read(response.data);
+        if (!text) throw situationError('empty', `모델이 답을 내지 않았습니다 (${String(response.data?.promptFeedback?.blockReason || response.data?.candidates?.[0]?.finishReason || response.data?.status || '빈 응답').slice(0, 60)}).`);
+        if (choice) workingSituationModels.set(workingModelKey(settings, choice), request.model);
+        return { text, model: request.model };
+      }
+      last = response;
+      // 다른 형식이나 다른 이름으로 다시 해 볼 만한 것은 "이 형식/모델을 모른다"는 400·404뿐이다. key·권한·한도·서버 오류는 바로 끝낸다.
+      if (![400, 404].includes(response.status) || /api key/i.test(apiErrorText(response))) break;
+      if (response.status === 404) missing.add(request.url);
+    }
+    throw situationError(`http-${last.status}`, `API가 요청을 받지 않았습니다 (HTTP ${last.status}${apiErrorText(last) ? ` · ${apiErrorText(last)}` : ''}).`);
   }
   // 답은 { "matched": ["S1", ...] } 하나여야 한다. 앞뒤에 다른 글이 섞였으면 JSON 부분만 읽되, 모양이 조금이라도 다르면 전부 미일치로 본다.
   // 보낸 적 없는 id는 버린다.
@@ -885,51 +928,42 @@
     '해당하는 조건의 id만 JSON으로 답한다. 예: {"matched":["S1"]}. 해당하는 것이 없으면 {"matched":[]}.',
     '확실하지 않으면 넣지 않는다. JSON 밖에는 아무 글도 쓰지 않는다.',
   ].join('\n');
-  // 판정에 보내는 것은 사용자가 화면에서 보는 대화뿐이다: 최근 메시지 몇 개(숨은 주입 블록 제거)와 지금 보내려는 USER 입력, 그리고 조건 id·문구.
-  // OOC 본문은 보내지 않는다.
-  function situationPrompt(context, items, settings) {
+  // 판정에 보내는 것은 사용자가 화면에서 보는 대화뿐이다: 최근 USER/AI 메시지 6개(숨은 주입 블록 제거)와 지금 보내려는 USER 입력, 그리고 조건 id·문구.
+  // "지금 이 OOC가 필요한 상황인가"만 묻는 용도라 대화 전체나 OOC 본문은 보내지 않는다. 장기 기억은 이 판정의 몫이 아니다.
+  function situationPrompt(context, items) {
     const clip = (text, max) => text.length <= max ? text : `${text.slice(0, Math.floor(max / 3))}\n…(중략)…\n${text.slice(-Math.floor(max * 2 / 3))}`;
-    const lines = (context.recent || []).filter(message => ['user', 'assistant'].includes(messageRoleOf(message))).slice(0, settings.recentMessages).reverse().map(message => {
+    const lines = (context.recent || []).filter(message => ['user', 'assistant'].includes(messageRoleOf(message))).slice(0, SITUATION_CONTEXT_MESSAGES).reverse().map(message => {
       const assistant = messageRoleOf(message) === 'assistant', text = assistant ? visibleAssistantText(messageTextOf(message)) : conditionSourceText(messageTextOf(message)).replace(/<!--[\s\S]*?-->/g, '').trim();
       return text ? `${assistant ? 'AI' : 'USER'}: ${clip(text, 1500)}` : '';
     }).filter(Boolean);
     const now = context.event === 'reroll' ? '[지금 상황]\n위의 마지막 AI 응답을 지우고 다시 생성하려는 참이다.' : `[지금 보내려는 USER 입력]\n${clip(String(context.userText || '').trim(), 2000) || '(내용 없음)'}`;
     return `[최근 대화 — 오래된 것부터]\n${lines.join('\n\n') || '(없음)'}\n\n${now}\n\n[상황 조건]\n${JSON.stringify(items)}`;
   }
-  // wanted: 열쇠 → 조건 문구. 한 generation에 요청은 한 번이다. 어떤 실패든 던지지 않고 전부 거짓으로 돌려준다:
-  // 상황 조건이 든 OOC만 빠지고 나머지 자동 OOC와 원래 전송은 그대로 간다.
+  // wanted: 열쇠 → 조건 문구. 한 generation에 판정은 한 번이고 3초(SITUATION_TIMEOUT_MS) 안에 끝낸다. 전송과 미리보기가 같은 함수를 쓴다.
+  // 어떤 실패든 던지지 않고 전부 거짓으로 돌려준다: 상황 조건이 든 OOC만 빠지고 나머지 자동 OOC와 원래 전송은 그대로 간다.
   async function judgeSituations(wanted, context, signal, settings = situationSettings) {
     const keys = [...wanted.keys()], ids = keys.map((_, index) => `S${index + 1}`), situations = new Map(keys.map(key => [key, false])), started = Date.now();
-    const info = { provider: settings.provider, model: settings.provider === 'firebase-vertex' ? settings.firebaseModel : settings.provider === 'google-ai-studio' ? settings.googleModel : '', conditions: keys.length, matched: 0, ms: 0, error: '' };
+    const info = { provider: settings.provider, model: settings.provider === 'firebase-vertex' ? settings.firebaseModel : settings.provider === 'google-ai-studio' ? settings.googleModel : '',
+      conditions: keys.length, matched: 0, ms: 0, error: '', contextMessages: SITUATION_CONTEXT_MESSAGES, timeoutMs: SITUATION_TIMEOUT_MS };
     if (!keys.length) return { situations, info };
-    const controller = new PageAbortController(), timer = setTimeout(() => controller.abort(), settings.timeoutMs), forward = () => controller.abort();
+    const controller = new PageAbortController(), timer = setTimeout(() => controller.abort(), SITUATION_TIMEOUT_MS), forward = () => controller.abort();
     if (signal?.aborted) controller.abort(); else signal?.addEventListener('abort', forward, { once: true });
     let message = '';
     try {
-      const text = await situationModelText(settings, SITUATION_SYSTEM_PROMPT, situationPrompt(context, keys.map((key, index) => ({ id: ids[index], condition: wanted.get(key) })), settings), controller.signal, started + settings.timeoutMs);
-      const matched = parseMatchedIds(text, new Set(ids));
+      const answer = await situationModelText(settings, SITUATION_SYSTEM_PROMPT, situationPrompt(context, keys.map((key, index) => ({ id: ids[index], condition: wanted.get(key) }))), controller.signal, started + SITUATION_TIMEOUT_MS);
+      const matched = parseMatchedIds(answer.text, new Set(ids));
       ids.forEach((id, index) => { if (matched.has(id)) situations.set(keys[index], true); });
-      info.matched = matched.size;
+      info.matched = matched.size; info.model = answer.model;
     } catch (error) {
       info.error = signal?.aborted ? 'prepare-timeout' : controller.signal.aborted ? 'timeout' : error?.situationCode || 'error';
-      message = info.error === 'timeout' || info.error === 'prepare-timeout' ? `응답이 ${Math.round(settings.timeoutMs / 100) / 10}초 안에 오지 않았습니다.` : String(error?.message || error).slice(0, 240);
+      message = info.error === 'timeout' || info.error === 'prepare-timeout' ? `응답이 ${SITUATION_TIMEOUT_MS / 1000}초 안에 오지 않았습니다.` : String(error?.message || error).slice(0, 240);
     } finally { clearTimeout(timer); signal?.removeEventListener('abort', forward); info.ms = Date.now() - started; }
     return { situations, info, message };
   }
-  // 연결 테스트: 보관함이나 대화에는 손대지 않고, 정해 둔 짧은 예문으로 요청 한 번만 보낸다.
+  // 연결 테스트: 보관함이나 대화에는 손대지 않고, 정해 둔 짧은 예문으로 판정 한 번만 해 본다.
   async function testSituationApi(settings) {
     const result = await judgeSituations(new Map([['test', 'USER가 인사를 건네는 상황']]), { recent: [], userText: '안녕하세요, 반갑습니다!', event: 'send' }, null, settings);
     return result.info.error ? `실패 · ${result.message || result.info.error}` : `성공 · ${result.info.model} · ${(result.info.ms / 1000).toFixed(1)}초 · 예문 판정 ${result.info.matched ? '일치' : '불일치'}`;
-  }
-  // Google AI Studio에서 지금 이 키로 쓸 수 있는 generateContent 모델 이름들.
-  async function listGoogleModels(apiKey) {
-    if (!apiKey) throw Error('API Key를 먼저 입력하세요.');
-    const controller = new PageAbortController(), timer = setTimeout(() => controller.abort(), 6000);
-    try {
-      const response = await externalJson('GET', 'https://generativelanguage.googleapis.com/v1beta/models?pageSize=200', { 'x-goog-api-key': apiKey }, undefined, controller.signal, 6000);
-      if (response.status < 200 || response.status >= 300) throw Error(`모델 목록을 받지 못했습니다 (HTTP ${response.status}${apiErrorText(response) ? ` · ${apiErrorText(response)}` : ''}).`);
-      return (response.data?.models || []).filter(model => (model?.supportedGenerationMethods || []).includes('generateContent')).map(model => geminiModelId(model?.name)).filter(Boolean);
-    } finally { clearTimeout(timer); }
   }
   // 복구 기록은 "어느 방의 어느 메시지에 어떤 generation marker가 남았을 수 있는지"만 담는다.
   // 본문 snapshot은 저장하지 않으며, cleanup은 항상 서버의 현재 본문에서 자기 marker 구간만 지운다.
@@ -1084,16 +1118,49 @@
     // API key나 Firebase config는 넣지 않는다. 상황 감지는 공급자 이름과 결과 숫자만 남긴다.
     return JSON.stringify({ hook: hookInfo, situationApi: situationSettings.provider, pendingCleanup: loadResidues(), recent: autoDiagnostics.slice(-5) }, null, 2);
   }
+  // 모델 조건 OOC가 켜져 있을 때만 방의 현재 모델을 읽는다. 최근 대화 조회와 함께 보내고, 실패하면 다른 출처로 판별한다.
+  function startModelLookup(data, chatId, signal) {
+    const needed = allEntries(data).some(entry => entry.autoInjection.enabled && entry.autoInjection.conditions.some(condition => condition.type === 'model'));
+    return { needed, room: needed ? fetchRoomModel(chatId, signal).catch(() => null) : Promise.resolve(null),
+      catalog: !needed ? Promise.resolve() : modelCatalog.length ? (void refreshModelCatalog().catch(() => {}), Promise.resolve()) : refreshModelCatalog(signal).catch(() => {}) };
+  }
+  // 이번 턴의 판정 한 벌: 조건 평가 → 상황 감지 → OOC 선택 → carrier 선택. 실제 전송(injectAutoOoc)과 설정의 "현재 턴 미리보기"
+  // (previewTurn)가 이 함수를 같이 쓴다. 읽기와 판정만 하며 서버의 메시지는 여기서 고치지 않는다.
+  async function evaluateTurn(data, turn, signal, api = situationSettings) {
+    const { event, recent, frame, userText } = turn;
+    // 글자수 조건의 기준. send는 방금 끝난 직전 AI 응답, reroll은 다시 만들 대상 응답이다. Crack의 reroll payload는
+    // { chatId, freeChatPassCampaignId, instruction }뿐이라 대상 id가 없고 항상 최신 AI 응답을 다시 만든다. 그래서 둘 다
+    // 목록의 최신 assistant를 읽되(주입 대상 carrier나 더 오래된 답변이 아니다), 교체되기 전의 본문을 지금 읽어 둔다.
+    const assistantText = frame.latest ? visibleAssistantText(messageTextOf(frame.latest)) : null;
+    await turn.lookup.catalog;
+    const room = await turn.lookup.room; await ensureRoomModelKnown(room, signal);
+    const model = currentModelContext(turn.payload, recent, room);
+    const request = { reason: event === 'reroll' ? 'before-reroll' : 'before-send', userText, recentText: visibleConversationText(recent), assistantText, model };
+    // 상황 감지: 로컬 조건을 모두 통과한 OOC의 상황 문구만 모아(중복 제거) 한 번에 묻는다. 모을 것이 없으면 요청하지 않는다.
+    // 실패·시간 초과는 전부 "해당 없음"이 되어 그 OOC만 빠진다.
+    const wanted = pendingSituations(data, request), judged = wanted.size ? await judgeSituations(wanted, { recent, userText, event }, signal, api) : null;
+    if (judged) request.situations = judged.situations;
+    const planned = selectAutoOoc(data, request);
+    // WRMC가 고를 carrier를 같은 알고리즘으로 예측해 제외하고, 남은 것 중 가장 가까운 안정 assistant를 쓴다.
+    const wish = detectWish(data, recent), choice = selectAutoCarrier(frame, wish.separate);
+    return { request, model, assistantText, judged, planned, wish, choice };
+  }
+  // carrier의 지금 본문에서 PATCH에 실을 본문을 만든다. 실제 주입과 미리보기가 이 함수 하나로 같은 글을 만든다.
+  // WRMC가 이미 쓰고 있는 메시지면 물러난다. 남아 있던 AUTO 구간은 빼고 이번 것 하나만 붙인다.
+  function composeCarrier(data, request, current, generationId) {
+    if (hasWishMarker(current)) throw skipInjection('carrier-has-wish-marker');
+    const base = removeAutoRegions(current);
+    if (!base.trim()) throw skipInjection('carrier-empty');
+    const fitted = fitBundleForCarrier(data, request, base, generationId);
+    return { base, fitted, text: fitted.region ? fitted.message : current, skip: !fitted.region };
+  }
   async function injectAutoOoc(parsed, signal, socket = null, diag = {}) {
     const skip = reason => { diag.skipReason = reason; return null; };
     const data = await abortable(readLibrary(), signal);
-    if (!data.autoSettings.autoInjectionEnabled || !allEntries(data).some(entry => entry.autoInjection.enabled)) return skip('auto-ooc-off');
+    if (!autoActive(data)) return skip('auto-ooc-off');
     const chatId = String(parsed.payload?.chatId || parsed.payload?.data?.chatId || ''); if (!chatId) return skip('no-chat-id');
     const justSent = [...live.values()].filter(row => row.chatId === chatId && row.state === 'armed' && !row.ended && Date.now() - row.sentAt < IN_PROGRESS_GRACE_MS);
-    // 모델 조건 OOC가 켜져 있을 때만 방의 현재 모델을 읽는다. 최근 대화 조회와 함께 보내고, 실패하면 다른 출처로 판별한다.
-    const needsModel = allEntries(data).some(entry => entry.autoInjection.enabled && entry.autoInjection.conditions.some(condition => condition.type === 'model'));
-    const roomModel = needsModel ? fetchRoomModel(chatId, signal).catch(() => null) : Promise.resolve(null);
-    const catalogReady = !needsModel ? Promise.resolve() : modelCatalog.length ? (void refreshModelCatalog().catch(() => {}), Promise.resolve()) : refreshModelCatalog(signal).catch(() => {});
+    const lookup = startModelLookup(data, chatId, signal);
     let recent = await fetchRecentMessages(chatId, signal, 50), frame = stableCarrierFrame(recent);
     if (frame.trailingUser) return skip('trailing-user');
     // 방금 내보낸 generation이 서버에 아직 반영되지 않았으면(최신 AI 답변이 그대로면) 컨텍스트를 읽기 전일 수 있다.
@@ -1109,33 +1176,16 @@
       recent = await fetchRecentMessages(chatId, signal, 50); frame = stableCarrierFrame(recent);
       if (frame.trailingUser) return skip('trailing-user');
     }
-    // C~E. 원래 USER 입력으로 조건을 다시 평가한다. reroll은 서버의 직전 USER 본문을 쓴다.
+    // C~G. 원래 USER 입력으로 조건을 다시 평가하고 carrier를 고른다. reroll은 서버의 직전 USER 본문을 쓴다.
     const payloadText = parsed.payload?.message ?? parsed.payload?.content ?? parsed.payload?.text;
     const userTextSource = parsed.event !== 'send' ? 'server-latest-user' : typeof payloadText === 'string' ? 'payload' : 'unknown';
     const userText = conditionSourceText(userTextSource === 'payload' ? payloadText : userTextSource === 'unknown' ? '' : messageTextOf(frame.latestUser));
-    diag.userTextSource = userTextSource;
-    // 글자수 조건의 기준. send는 방금 끝난 직전 AI 응답, reroll은 다시 만들 대상 응답이다. Crack의 reroll payload는
-    // { chatId, freeChatPassCampaignId, instruction }뿐이라 대상 id가 없고 항상 최신 AI 응답을 다시 만든다. 그래서 둘 다
-    // 목록의 최신 assistant를 읽되(주입 대상 carrier나 더 오래된 답변이 아니다), 교체되기 전의 본문을 지금 읽어 둔다.
-    const assistantText = frame.latest ? visibleAssistantText(messageTextOf(frame.latest)) : null;
-    Object.assign(diag, { assistantChars: assistantText === null ? null : assistantText.length, assistantSource: !frame.latest ? 'none' : parsed.event === 'reroll' ? 'reroll-target' : 'latest', assistantMessageId: messageIdOf(frame.latest) });
-    await catalogReady;
-    const room = await roomModel; await ensureRoomModelKnown(room, signal);
-    const model = currentModelContext(parsed.payload, recent, room);
-    const request = { reason: parsed.event === 'reroll' ? 'before-reroll' : 'before-send', userText, recentText: visibleConversationText(recent), assistantText, model };
-    // 상황 감지: 로컬 조건을 모두 통과한 OOC의 상황 문구만 모아(중복 제거) 한 번에 묻는다. 모을 것이 없으면 요청하지 않는다.
-    // 실패·시간 초과는 전부 "해당 없음"이 되어 그 OOC만 빠진다.
-    const wanted = pendingSituations(data, request);
-    if (wanted.size) {
-      const judged = await judgeSituations(wanted, { recent, userText, event: parsed.event }, signal);
-      request.situations = judged.situations; diag.situation = judged.info;
-    }
-    const planned = selectAutoOoc(data, request);
-    Object.assign(diag, { userChars: userText.length, modelDetected: planned.modelDetected, matched: planned.matched, selected: planned.selected, omitted: planned.omitted, bundleChars: planned.chars });
-    if (needsModel) diag.model = { source: model.source, crackerModel: model.crackerModel, chatModelId: model.chatModelId, name: model.name || model.label };
+    Object.assign(diag, { userTextSource, assistantSource: !frame.latest ? 'none' : parsed.event === 'reroll' ? 'reroll-target' : 'latest', assistantMessageId: messageIdOf(frame.latest) });
+    const { request, model, assistantText, judged, planned, wish, choice } = await evaluateTurn(data, { event: parsed.event, payload: parsed.payload, recent, frame, userText, lookup }, signal);
+    if (judged) diag.situation = judged.info;
+    Object.assign(diag, { assistantChars: assistantText === null ? null : assistantText.length, userChars: userText.length, modelDetected: planned.modelDetected, matched: planned.matched, selected: planned.selected, omitted: planned.omitted, bundleChars: planned.chars });
+    if (lookup.needed) diag.model = { source: model.source, crackerModel: model.crackerModel, chatModelId: model.chatModelId, name: model.name || model.label };
     if (!planned.block) return skip(planned.matched.length ? 'over-budget' : 'no-matching-ooc');
-    // F~G. WRMC가 고를 carrier를 같은 알고리즘으로 예측해 제외하고, 남은 것 중 가장 가까운 안정 assistant를 쓴다.
-    const wish = detectWish(data, recent), choice = selectAutoCarrier(frame, wish.separate);
     Object.assign(diag, { wrmc: { mode: wish.mode, signals: wish.signals, separate: wish.separate }, predictedWrmcCarrierId: choice.predictedWishId,
       carrierId: choice.carrierId, carriersSeparated: !!choice.carrierId && choice.carrierId !== choice.predictedWishId, rejectedCarriers: choice.rejected });
     if (!choice.carrier) return skip('no-independent-carrier');
@@ -1144,25 +1194,20 @@
     diag.generationId = generationId; diagnosticsById.set(generationId, diag);
     live.set(generationId, { chatId, state: 'preparing', sentAt: 0, lastStreamAt: 0, socket });
     try {
-      const result = await mutateCarrier(record, current => {
-        // H~I. PATCH 직전 최신 본문 기준 안전 조건. WRMC가 이미 쓰고 있는 메시지면 물러난다.
-        if (hasWishMarker(current)) throw skipInjection('carrier-has-wish-marker');
-        const base = removeAutoRegions(current);
-        if (!base.trim()) throw skipInjection('carrier-empty');
-        const fitted = fitBundleForCarrier(data, request, base, generationId);
-        return fitted.region ? { text: fitted.message, fitted } : { text: current, skip: true, fitted };
-      }, (observed, built) => !!built?.fitted?.region && normalizeBreaks(observed) === normalizeBreaks(built.text) && countAutoRegions(observed) === 1 && countAutoRegions(observed, generationId) === 1,
-      signal, {
-        async guard() {
-          if (currentChatId() !== chatId) throw skipInjection('chat-changed');
-          if (socket && socket.readyState !== 1) throw skipInjection('socket-not-open');
-          const now = stableCarrierFrame(await fetchRecentMessages(chatId, signal, 30));
-          const again = selectAutoCarrier(now, wish.separate || detectWish(data, now.messages).separate);
-          if (now.trailingUser || messageIdOf(now.latest) === record.messageId || again.carrierId !== record.messageId || wish.separate && again.predictedWishId === record.messageId) throw skipInjection('carrier-changed');
-        },
-        // 복구 기록을 PATCH보다 먼저 남긴다. PATCH 응답을 못 받아도 잔여물 위치를 잃지 않는다.
-        beforePatch() { record.journaled = true; rememberResidue(record); },
-      });
+      // H~I. PATCH 직전 최신 본문 기준으로 본문을 만들고 안전 조건을 다시 본다.
+      const result = await mutateCarrier(record, current => composeCarrier(data, request, current, generationId),
+        (observed, built) => !!built?.fitted?.region && normalizeBreaks(observed) === normalizeBreaks(built.text) && countAutoRegions(observed) === 1 && countAutoRegions(observed, generationId) === 1,
+        signal, {
+          async guard() {
+            if (currentChatId() !== chatId) throw skipInjection('chat-changed');
+            if (socket && socket.readyState !== 1) throw skipInjection('socket-not-open');
+            const now = stableCarrierFrame(await fetchRecentMessages(chatId, signal, 30));
+            const again = selectAutoCarrier(now, wish.separate || detectWish(data, now.messages).separate);
+            if (now.trailingUser || messageIdOf(now.latest) === record.messageId || again.carrierId !== record.messageId || wish.separate && again.predictedWishId === record.messageId) throw skipInjection('carrier-changed');
+          },
+          // 복구 기록을 PATCH보다 먼저 남긴다. PATCH 응답을 못 받아도 잔여물 위치를 잃지 않는다.
+          beforePatch() { record.journaled = true; rememberResidue(record); },
+        });
       if (!result.verified) { live.delete(generationId); return skip(result.missing ? 'carrier-missing' : 'over-budget'); }
       const fitted = result.built.fitted.result;
       Object.assign(diag, { selected: fitted.selected, omitted: fitted.omitted, bundleChars: fitted.chars, patched: true, verified: true, cleanup: 'pending' });
@@ -1177,6 +1222,33 @@
       try { await cleanupAutoRecord(record, controller.signal, 'inject-failed'); } finally { clearTimeout(timer); }
       return null;
     }
+  }
+  // 설정의 "현재 턴 미리보기". 지금 입력창의 글을 보낸다고 할 때 실제 전송이 할 일을 같은 함수(evaluateTurn, composeCarrier)로
+  // 끝까지 계산해, PATCH에 실릴 carrier 본문을 그대로 돌려준다. 서버에는 GET(과 상황 감지 판정)만 보낸다:
+  // PATCH, 복구 기록, live 등록, cleanup을 하지 않는다. carrier에 예전 AUTO 구간이 남아 있어도 지우지 않고 계산에서만 뺀다
+  // (실제 전송은 보내기 전에 지운다). generation id 자리에는 실제로 쓰이지 않는 PREVIEW_GENERATION_ID가 들어간다.
+  async function previewTurn(data, api = situationSettings) {
+    const editor = document.querySelector('.__chat_input_textarea[contenteditable="true"]');
+    const shown = { chatId: currentChatId(), userText: conditionSourceText(editor?.innerText ?? editor?.textContent ?? ''), reason: '', error: '', turn: null, carrier: null, maxChars: normalizeSettings(data.autoSettings).autoOocMaxChars };
+    const stop = (reason, error = '') => Object.assign(shown, { reason, error });
+    if (!autoActive(data)) return stop('auto-ooc-off');
+    if (!shown.chatId) return stop('no-chat');
+    const controller = new PageAbortController(), timer = setTimeout(() => controller.abort(), PREPARE_TIMEOUT_MS), signal = controller.signal;
+    try {
+      const lookup = startModelLookup(data, shown.chatId, signal), recent = await fetchRecentMessages(shown.chatId, signal, 50), frame = stableCarrierFrame(recent);
+      if (frame.trailingUser) return stop('trailing-user');
+      const turn = shown.turn = await evaluateTurn(data, { event: 'send', payload: null, recent, frame, userText: shown.userText, lookup }, signal, api);
+      if (!turn.planned.block) return stop(turn.planned.matched.length ? 'over-budget' : 'no-matching-ooc');
+      if (!turn.choice.carrier) return stop(!frame.stable.length ? 'no-stable-assistant' : turn.choice.rejected.every(row => row.reason === 'empty-body') ? 'carrier-empty' : 'no-independent-carrier');
+      const message = await fetchCarrierMessage(shown.chatId, turn.choice.carrierId, signal);
+      if (!message) return stop('carrier-missing');
+      const current = messageTextOf(message), made = composeCarrier(data, turn.request, current, PREVIEW_GENERATION_ID);
+      if (made.skip) return stop('over-budget');
+      shown.carrier = { id: turn.choice.carrierId, raw: made.text, base: made.base, region: made.fitted.region, result: made.fitted.result, staleRegions: countAutoRegions(current) };
+      return shown;
+    } catch (error) {
+      return error?.code === 'AUTO_OOC_SKIP' ? stop(error.reason) : stop('lookup-failed', String(error?.message || error).slice(0, 160));
+    } finally { clearTimeout(timer); }
   }
   const STREAM_CHUNK_PATTERN = /^42(?:\/v3\/chats,)?\d*\["characterMessageGenerating"/;
   const COMPLETED_FRAME_PATTERN = /^42(?:\/v3\/chats,)?\d*\["characterMessageGenerated"/;
@@ -1217,7 +1289,7 @@
       // 사용자가 생성을 멈추면 Crack은 { chatId }만 담은 stop을 보낸다. frame은 그대로 넘기고, 남은 block은 잠시 뒤 정리한다.
       if (parsed?.event === 'stop' && chatId) endGenerations('generation-stopped', row => String(row.chatId) === chatId, 1000);
       if (!parsed || !['send', 'reroll'].includes(parsed.event) || !chatId || chatId !== currentChatId()) return previousSend.call(this, data);
-      if (library && (!library.autoSettings.autoInjectionEnabled || !allEntries(library).some(entry => entry.autoInjection.enabled))) return previousSend.call(this, data);
+      if (library && !autoActive(library)) return previousSend.call(this, data);
       // 가로챈 frame은 어떤 경우에도 버리지 않는다. 같은 방의 frame은 들어온 순서대로 내보내고,
       // 앞선 generation이 진행 중이면 뒤 frame은 자동 OOC 없이 그대로 넘긴다 (block은 generation당 하나).
       const socket = this, previous = sendQueues.get(chatId) || Promise.resolve();
@@ -1257,14 +1329,11 @@
     Object.defineProperty(W, '__CRACK_OOC_LIBRARY_TEST_API__', { configurable: true, value: {
       check, transport, selectAutoOoc: (data, request) => selectAutoOoc(check(data), request), stableCarrierFrame, selectAutoCarrier, detectWish, removeAutoRegions, countAutoRegions, autoRegion, autoRegionOverhead,
       conditionSourceText, cleanupAutoRecord, cleanupChatResidues, injectAutoOoc, markerPattern, fitBundleForCarrier, loadResidues, diagnostics: autoDiagnostics, hookInfo, live,
+      composeCarrier, previewTurn: (data, api) => previewTurn(check(data), api), PREVIEW_GENERATION_ID,
       modelOptions, legacyModelKey, refreshModelCatalog, currentModelContext, visibleAssistantText,
       parseFirebaseAppConfig, normalizeSituationSettings, saveSituationSettings, judgeSituations, parseMatchedIds, pendingSituations: (data, request) => pendingSituations(check(data), request),
-      testSituationApi, situationPrompt, diagnosticsText, backupText: data => JSON.stringify(check(data), null, 2),
+      testSituationApi, situationPrompt, diagnosticsText, SITUATION_MODELS, SITUATION_CONTEXT_MESSAGES, SITUATION_TIMEOUT_MS,
     } });
-  }
-  function backup(data) {
-    const url = URL.createObjectURL(new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' }));
-    const anchor = node('a'); anchor.href = url; anchor.download = `OOC-${new Date().toISOString().slice(0, 10)}.json`; anchor.click(); setTimeout(() => URL.revokeObjectURL(url), 1000);
   }
   async function showManager() {
     await readLibrary(); if (manager) return;
@@ -1282,7 +1351,7 @@
     view.header.replaceChildren(view.label);
     if (editing) { const dot = node('span', 'oa-dot'); dot.title = '미저장 변경'; dot.setAttribute('aria-label', '미저장 변경'); view.header.append(dot); }
     const buttons = node('div', 'oa-actions');
-    buttons.append(action('DB 연동', showConnection, settings.mode === 'firebase' ? 'flame' : 'local'), action('설정', showBackup, 'gear'), action('저장', saveLibrary, 'save'), action('닫기', exitManager, 'close'));
+    buttons.append(action('DB 연동', showConnection, settings.mode === 'firebase' ? 'flame' : 'local'), action('설정', showSettings, 'gear'), action('저장', saveLibrary, 'save'), action('닫기', exitManager, 'close'));
     buttons.querySelectorAll('button').forEach(button => { button.disabled = saving; });
     buttons.children[2].disabled = saving || !editing; view.header.append(buttons); view.body.replaceChildren(); view.footer.hidden = true;
     const toolbar = node('div', 'oa-toolbar'), search = node('div', 'oa-search'); search.innerHTML = svg('search');
@@ -1477,7 +1546,62 @@
     if (!await confirm('삭제 확인', index === undefined ? '카테고리와 안에 있는 모든 OOC를 삭제할까요?' : '이 OOC를 삭제할까요?', '삭제')) return;
     change(data => { if (index === undefined) { data.categories.splice(category, 1); expanded.clear(); } else contents(data, category).splice(index, 1); });
   }
-  function showBackup() {
+  const PREVIEW_REASONS = {
+    'auto-ooc-off': '자동 OOC가 꺼져 있거나 자동주입을 켠 OOC가 없습니다.',
+    'no-chat': '채팅방 화면이 아니어서 확인할 대화가 없습니다.',
+    'trailing-user': '마지막 메시지가 아직 답을 받지 못한 USER 입력입니다. 이런 턴은 자동 OOC를 건너뜁니다.',
+    'no-matching-ooc': '지금 조건에 맞는 OOC가 없습니다.',
+    'over-budget': '조건에 맞는 OOC가 있지만 최대 글자수 안에 하나도 들어가지 않습니다.',
+    'no-stable-assistant': '붙일 수 있는 과거 AI 답변이 아직 없습니다. 최신 AI 답변과 그 앞의 USER 입력보다 오래된 AI 답변이 있어야 합니다.',
+    'no-independent-carrier': 'Wish RP Manager가 쓰는 답변과 겹치지 않는 과거 AI 답변이 없습니다.',
+    'carrier-empty': '붙일 과거 AI 답변의 본문이 비어 있습니다.',
+    'carrier-has-wish-marker': '붙일 과거 AI 답변을 Wish RP Manager가 이미 쓰고 있습니다.',
+    'carrier-missing': '붙일 과거 AI 답변을 서버에서 찾지 못했습니다.',
+    'lookup-failed': '대화를 조회하지 못했습니다.',
+  };
+  async function copyText(text, shownIn) {
+    try { await navigator.clipboard.writeText(text); return; } catch { /* 클립보드 권한이 없으면 선택 복사로 넘어간다. */ }
+    shownIn.focus(); shownIn.select();
+    if (!document.execCommand('copy')) throw Error('복사하지 못했습니다. 글을 직접 선택해 복사하세요.');
+  }
+  // 미리보기 결과를 그린다. 요약 줄과 전체 메시지(RAW)는 previewTurn이 돌려준 결과 하나에서 나온다.
+  function drawPreview(root, data, shown) {
+    const line = text => root.append(node('small', '', text)), count = value => value.toLocaleString(), turn = shown.turn, final = shown.carrier?.result || turn?.planned;
+    const uses = type => allEntries(data).some(item => item.autoInjection.enabled && item.autoInjection.conditions.some(condition => condition.type === type));
+    const rawBox = (label, text, rows) => { const box = node('textarea', 'oa-raw-text'); box.readOnly = true; box.rows = rows; box.spellcheck = false; box.value = text; box.setAttribute('aria-label', label); return box; };
+    root.replaceChildren();
+    if (shown.carrier) final.selected.forEach((item, order) => root.append(node('div', '', `${order + 1}. ${item.name}`)));
+    else root.append(node('span', 'oa-muted', `이번 턴에는 자동 OOC가 붙지 않습니다. ${PREVIEW_REASONS[shown.reason] || shown.reason}${shown.error ? ` (${shown.error})` : ''}`));
+    if (shown.carrier) line(`보관함 순서대로 적용 · AUTO 구간 ${count(final.chars)}자 / 최대 ${count(shown.maxChars)}자`);
+    else if (final?.selected.length) line(`조건에 맞은 OOC: ${final.selected.map(item => item.name).join(', ')}`);
+    const overBudget = (final?.omitted || []).filter(item => item.reason === 'over-budget');
+    if (overBudget.length) line(`한도 때문에 제외: ${overBudget.map(item => item.name).join(', ')}`);
+    if (turn) {
+      const judged = turn.judged, model = turn.model;
+      if (judged) line(judged.info.error ? `상황 감지 실패(${judged.message || judged.info.error}) → 상황 조건이 든 OOC는 빠집니다.` : `상황 감지: 조건 ${judged.info.conditions}개 중 ${judged.info.matched}개 해당 (${(judged.info.ms / 1000).toFixed(1)}초)`);
+      else if (uses('situation')) line('상황 감지: 다른 조건에서 먼저 걸러져 이번에는 API에 묻지 않습니다.');
+      if (uses('assistantLength')) line(typeof turn.assistantText === 'string' ? `직전 AI 응답: ${count(turn.assistantText.length)}자` : '직전 AI 응답을 찾지 못해 글자수 조건 OOC는 빠집니다.');
+      if (uses('model')) line(turn.planned.modelDetected ? `현재 모델: ${model?.name || model?.label || model?.crackerModel || '확인됨'}` : '현재 모델을 확인하지 못해 모델 조건 OOC는 빠집니다.');
+    }
+    if (shown.carrier) {
+      const { id, raw, base, region, staleRegions } = shown.carrier, details = node('details', 'oa-raw'), copied = node('span', 'oa-muted', ''), buttons = node('div', 'oa-button-row');
+      line(`주입 대상: ${id !== turn.choice.predictedWishId ? 'WRMC와 분리된 과거 AI 답변' : '최신 직전의 과거 AI 답변'} (메시지 ${id})`);
+      const box = rawBox('전체 메시지 미리보기', raw, 14);
+      buttons.append(action('복사', async () => { await copyText(raw, box); copied.textContent = '복사했습니다.'; }), copied);
+      details.append(node('summary', '', '전체 메시지 미리보기'),
+        node('p', 'oa-raw-stats', [`원래 carrier 본문 ${count(base.length)}자`, `AUTO region ${count(region.length)}자`, `최종 carrier 본문 ${count(raw.length)}자`, `AUTO 예산 ${count(final.chars)} / ${count(shown.maxChars)}자`, `선택된 OOC ${final.selected.length}개`].join(' · ')),
+        node('p', 'oa-raw-stats', `지금 전송하면 위 AI 답변에 응답이 끝날 때까지 저장될 본문입니다. 미리보기용 id(${PREVIEW_GENERATION_ID})만 실제와 다릅니다. 미리보기는 서버의 메시지를 고치지 않습니다.${staleRegions ? ` 이 답변에 남아 있는 예전 AUTO 구간 ${staleRegions}개는 실제 전송 전에 지워지며, 아래 본문에는 빠져 있습니다.` : ''}`),
+        box, buttons);
+      root.append(details);
+    }
+    if (shown.chatId) {
+      const details = node('details', 'oa-raw');
+      details.append(node('summary', '', '현재 USER 입력'), node('p', 'oa-raw-stats', shown.userText ? `${count(shown.userText.length)}자 · 입력창의 글은 고치지 않고 그대로 전송됩니다.` : '입력창이 비어 있습니다. 조건은 빈 입력으로 판정했습니다.'));
+      if (shown.userText) details.append(rawBox('현재 USER 입력', shown.userText, 4));
+      root.append(details);
+    }
+  }
+  function showSettings() {
     const view = dialog('설정'); const data = editing || library, autoHeading = node('h3', '', '자동 OOC');
     const autoArea = node('section', 'oa-settings-section'), enabled = toggleField(autoArea, '자동 OOC 사용', data.autoSettings.autoInjectionEnabled, 'USER 입력문은 건드리지 않습니다. 과거 AI 답변 하나에 응답이 끝날 때까지만 숨김 주석으로 붙였다가 제거합니다. 독립된 답변을 확보하지 못한 턴은 자동 OOC만 건너뜁니다.');
     const maxChars = field(autoArea, '자동 OOC 최대 글자수 (USER 2,000자와 별개 · marker/구분자 포함)', 'input', String(data.autoSettings.autoOocMaxChars)); maxChars.type = 'number'; maxChars.min = '0'; maxChars.max = '50000'; maxChars.step = '100';
@@ -1486,50 +1610,35 @@
     wrmcMode.value = data.autoSettings.wrmcCarrierMode;
     const draftSettings = () => normalizeSettings({ autoInjectionEnabled: enabled.checked, autoOocMaxChars: Number(maxChars.value), wrmcCarrierMode: wrmcMode.value });
     const preview = node('div', 'oa-preview'), previewTitle = node('strong', '', '자동 적용 예정'), previewList = node('div', 'oa-preview-list', '미리보기를 눌러 확인하세요.'); preview.append(previewTitle, previewList);
+    // 화면에서 고친(아직 적용하지 않은) 설정과 보관함으로 실제 전송과 같은 계산을 해 본다. 서버의 메시지는 읽기만 한다.
     const previewButton = action('현재 턴 미리보기', async () => {
-      const context = await standalonePreviewContext();
       const draft = copy(editing || library); draft.autoSettings = draftSettings();
-      // 미리보기도 실제 전송과 같은 순서로 판정한다: 로컬 조건을 통과한 OOC의 상황 조건만 한 번에 묻는다.
-      const wanted = draft.autoSettings.autoInjectionEnabled ? pendingSituations(draft, { ...context, reason: 'preview' }) : new Map();
-      const judged = wanted.size ? await judgeSituations(wanted, { recent: context.messages || [], userText: context.userText, event: 'send' }) : null;
-      if (judged) context.situations = judged.situations;
-      const result = selectAutoOoc(draft, { ...context, reason: 'preview', maxChars: Number(maxChars.value) });
-      previewList.replaceChildren();
-      if (!result.selected.length) previewList.append(node('span', 'oa-muted', '현재 조건에 맞는 OOC가 없습니다.'));
-      else result.selected.forEach((item, order) => previewList.append(node('div', '', `${order + 1}. ${item.name}`)));
-      if (result.selected.length) previewList.append(node('small', '', `보관함 순서대로 적용 · 예상 ${result.chars.toLocaleString()}자 / 최대 ${result.maxChars.toLocaleString()}자`));
-      const overBudget = result.omitted.filter(item => item.reason === 'over-budget');
-      if (overBudget.length) previewList.append(node('small', '', `한도 때문에 제외: ${overBudget.map(item => item.name).join(', ')}`));
-      const uses = type => allEntries(draft).some(item => item.autoInjection.enabled && item.autoInjection.conditions.some(condition => condition.type === type));
-      if (judged) previewList.append(node('small', '', judged.info.error ? `상황 감지 실패(${judged.message || judged.info.error}) → 상황 조건이 든 OOC는 빠집니다.` : `상황 감지: 조건 ${judged.info.conditions}개 중 ${judged.info.matched}개 해당 (${(judged.info.ms / 1000).toFixed(1)}초)`));
-      else if (uses('situation')) previewList.append(node('small', '', '상황 감지: 다른 조건에서 먼저 걸러져 이번에는 API에 묻지 않습니다.'));
-      if (uses('assistantLength')) previewList.append(node('small', '', typeof context.assistantText === 'string' ? `직전 AI 응답: ${context.assistantText.length.toLocaleString()}자` : '직전 AI 응답을 찾지 못해 글자수 조건 OOC는 빠집니다.'));
-      if (uses('model')) previewList.append(node('small', '', result.modelDetected ? `현재 모델: ${context.model?.name || context.model?.label || context.model?.crackerModel || '확인됨'}` : '현재 모델을 확인하지 못해 모델 조건 OOC는 빠집니다.'));
-      if (context.frame) {
-        const choice = selectAutoCarrier(context.frame, detectWish(draft, context.frame.messages).separate);
-        previewList.append(node('small', '', context.frame.trailingUser ? '주입 대상: 답 없는 USER가 마지막이라 이번 턴은 건너뜁니다.' : !choice.carrier ? '주입 대상: 독립된 과거 AI 답변이 없어 이번 턴은 건너뜁니다.' : choice.carrierId !== choice.predictedWishId ? '주입 대상: WRMC와 분리된 과거 AI 답변' : '주입 대상: 최신 직전의 과거 AI 답변'));
-      }
+      previewList.replaceChildren(node('span', 'oa-muted', '확인 중…'));
+      drawPreview(previewList, draft, await previewTurn(draft));
     });
     const diagnostics = node('details', 'oa-diagnostics'), diagnosticsBody = node('pre', '', ''); diagnostics.append(node('summary', '', '진단 (최근 자동 OOC)'), diagnosticsBody);
     diagnostics.addEventListener('toggle', () => { if (diagnostics.open) diagnosticsBody.textContent = diagnosticsText(); });
     autoArea.prepend(autoHeading); autoArea.append(previewButton, preview, diagnostics);
-    // 상황 감지 API 설정. 보관함 자료(저장·백업·동기화)와 따로 이 브라우저에만 둔다.
+    // 상황 감지 API 설정. 보관함 자료(저장·동기화)와 따로 이 브라우저에만 둔다.
     const apiArea = node('section', 'oa-settings-section'), api = situationSettings; apiArea.append(node('h3', '', '상황 감지 API'));
     const provider = field(apiArea, '공급자', 'select');
     for (const [value, label] of [['off', '사용 안 함'], ['google-ai-studio', 'Google AI Studio'], ['firebase-vertex', 'Firebase Vertex AI']]) provider.append(new Option(label, value));
     provider.value = api.provider;
-    const googleBox = node('div', 'oa-api-fields'), firebaseBox = node('div', 'oa-api-fields'), commonBox = node('div', 'oa-api-fields');
+    // 고를 수 있는 모델은 둘뿐이다. 예전 버전에서 다른 모델 이름을 저장해 두었으면 다른 것을 고르기 전까지 그 값을 그대로 둔다.
+    const modelField = (box, title, current) => {
+      const select = field(box, title, 'select'), known = situationModelChoice(current);
+      for (const choice of SITUATION_MODELS) select.append(new Option(choice.label, choice.ids[0]));
+      if (!known) select.append(new Option(`기존 설정 유지 · ${current}`, current));
+      select.value = known ? known.ids[0] : current; return select;
+    };
+    const googleBox = node('div', 'oa-api-fields'), firebaseBox = node('div', 'oa-api-fields');
     const googleKey = field(googleBox, 'API Key', 'input', api.googleApiKey); googleKey.type = 'password'; googleKey.autocomplete = 'off'; googleKey.spellcheck = false;
-    const googleModel = field(googleBox, '모델', 'input', api.googleModel); googleModel.spellcheck = false;
-    const modelNames = node('datalist'); modelNames.id = `oa-google-models-${Date.now()}`; googleModel.setAttribute('list', modelNames.id); googleBox.append(modelNames);
-    googleBox.append(action('모델 목록 불러오기', async () => { const names = await listGoogleModels(googleKey.value.trim()); modelNames.replaceChildren(...names.map(name => new Option(name, name))); apiState.textContent = `모델 ${names.length}개를 불러왔습니다. 모델 칸에서 고를 수 있습니다.`; }));
+    const googleModel = modelField(googleBox, '모델', api.googleModel);
     const firebaseText = field(firebaseBox, 'Firebase config', 'textarea', api.firebaseConfig ? JSON.stringify(api.firebaseConfig, null, 2) : ''); firebaseText.rows = 8; firebaseText.spellcheck = false;
     firebaseText.placeholder = 'const firebaseConfig = {\n  apiKey: "...",\n  authDomain: "...",\n  projectId: "...",\n  storageBucket: "...",\n  messagingSenderId: "...",\n  appId: "..."\n};';
-    const firebaseModel = field(firebaseBox, 'Vertex 모델', 'input', api.firebaseModel); firebaseModel.spellcheck = false;
-    const firebaseLocation = field(firebaseBox, 'Location', 'input', api.firebaseLocation); firebaseLocation.spellcheck = false;
+    const firebaseModel = modelField(firebaseBox, 'Vertex 모델', api.firebaseModel);
+    const firebaseLocation = field(firebaseBox, 'Location (3.8 Flash는 항상 global로 요청)', 'input', api.firebaseLocation); firebaseLocation.spellcheck = false;
     const appCheck = field(firebaseBox, 'App Check 디버그 토큰 (프로젝트에서 App Check를 켠 경우에만)', 'input', api.firebaseAppCheckDebugToken); appCheck.type = 'password'; appCheck.autocomplete = 'off';
-    const recentCount = field(commonBox, '판정에 보낼 최근 메시지 수 (2~12)', 'input', String(api.recentMessages)); recentCount.type = 'number'; recentCount.min = '2'; recentCount.max = '12';
-    const waitSeconds = field(commonBox, '응답 대기 시간 (초, 1~6)', 'input', String(api.timeoutMs / 1000)); waitSeconds.type = 'number'; waitSeconds.min = '1'; waitSeconds.max = '6'; waitSeconds.step = '0.5';
     const apiState = node('p', 'oa-auth-state', '');
     // 화면의 값으로 설정을 만든다. Firebase를 고른 상태에서 config가 틀리면 어떤 값이 빠졌는지 알려 준다.
     const apiDraft = () => {
@@ -1537,64 +1646,20 @@
       if (provider.value === 'firebase-vertex') firebaseConfig = parseFirebaseAppConfig(firebaseText.value);
       else if (firebaseText.value.trim()) { try { firebaseConfig = parseFirebaseAppConfig(firebaseText.value); } catch { /* 쓰지 않는 공급자의 칸은 저장된 값을 그대로 둔다. */ } } else firebaseConfig = null;
       if (provider.value === 'google-ai-studio' && !googleKey.value.trim()) throw Error('Google AI Studio API Key를 입력하세요.');
-      const seconds = Number(waitSeconds.value), count = Number(recentCount.value);
-      if (!(seconds >= 1 && seconds <= 6)) throw Error('응답 대기 시간은 1~6초로 입력하세요.');
-      if (!Number.isInteger(count) || count < 2 || count > 12) throw Error('최근 메시지 수는 2~12 정수로 입력하세요.');
-      return normalizeSituationSettings({ provider: provider.value, googleApiKey: googleKey.value, googleModel: googleModel.value, firebaseConfig, firebaseModel: firebaseModel.value, firebaseLocation: firebaseLocation.value,
-        firebaseAppCheckDebugToken: appCheck.value, recentMessages: count, timeoutMs: Math.round(seconds * 1000) });
+      return normalizeSituationSettings({ provider: provider.value, googleApiKey: googleKey.value, googleModel: googleModel.value, firebaseConfig, firebaseModel: firebaseModel.value, firebaseLocation: firebaseLocation.value, firebaseAppCheckDebugToken: appCheck.value });
     };
-    const apiButtons = node('div', 'oa-backup');
+    const apiButtons = node('div', 'oa-button-row');
     apiButtons.append(action('연결 테스트', async () => { const draft = apiDraft(); if (draft.provider === 'off') throw Error('공급자를 먼저 고르세요.'); apiState.textContent = '확인 중…'; apiState.textContent = await testSituationApi(draft); }),
-      action('API 설정 저장', () => { saveSituationSettings(apiDraft()); apiState.textContent = '저장했습니다. 이 브라우저에만 저장되며 백업·동기화에는 들어가지 않습니다.'; }, null, 'oa-primary'));
-    const syncApiUi = () => { googleBox.hidden = provider.value !== 'google-ai-studio'; firebaseBox.hidden = provider.value !== 'firebase-vertex'; commonBox.hidden = apiButtons.hidden = provider.value === 'off'; apiState.textContent = ''; };
+      action('API 설정 저장', () => { saveSituationSettings(apiDraft()); apiState.textContent = '저장했습니다. 이 브라우저에만 저장되며 Firebase 동기화에는 들어가지 않습니다.'; }, null, 'oa-primary'));
+    const syncApiUi = () => { googleBox.hidden = provider.value !== 'google-ai-studio'; firebaseBox.hidden = provider.value !== 'firebase-vertex'; apiButtons.hidden = provider.value === 'off'; apiState.textContent = ''; };
     provider.addEventListener('change', syncApiUi);
-    apiArea.append(googleBox, firebaseBox, commonBox, apiButtons, apiState, node('p', 'oa-hint', '"상황 감지 (API)" 조건이 든 OOC가 다른 조건을 모두 통과했을 때만, 최근 대화 일부와 조건 문구를 고른 API로 보냅니다. OOC 내용은 보내지 않습니다. 응답이 늦거나 실패하면 그 OOC만 빠지고 전송은 그대로 진행됩니다.'));
+    apiArea.append(googleBox, firebaseBox, apiButtons, apiState, node('p', 'oa-hint', `"상황 감지 (API)" 조건이 든 OOC가 다른 조건을 모두 통과했을 때만, 최근 메시지 ${SITUATION_CONTEXT_MESSAGES}개와 지금 입력, 조건 문구를 고른 API로 보냅니다. OOC 내용은 보내지 않습니다. ${SITUATION_TIMEOUT_MS / 1000}초 안에 답이 없거나 실패하면 그 OOC만 빠지고 전송은 그대로 진행됩니다.`));
     syncApiUi();
-    const heading = node('h3', '', '백업'); const buttons = node('div', 'oa-backup');
-    const file = node('input'); file.type = 'file'; file.accept = '.json,application/json'; file.hidden = true;
-    file.addEventListener('change', async () => {
-      if (!file.files[0]) return;
-      try {
-        const data = check(JSON.parse(await file.files[0].text()));
-        if (!await confirm('전체 복원', `현재 전체 자료와 미저장 변경을 백업의 OOC ${total(data)}개로 교체합니다. 저장을 누르면 기존 DB 자료가 덮어써집니다. 계속할까요?`, '복원')) return;
-        data.updatedAt = library.updatedAt; editing = data; expanded.clear(); drawManager(); view.close();
-      } catch (error) { alert(`복원 실패: ${error.message}`); }
-    });
-    buttons.append(action('전체 백업', () => backup(editing || library)), action('전체 복원', () => file.click())); view.body.append(autoArea, apiArea, heading, buttons, file);
+    view.body.append(autoArea, apiArea);
     view.footer.append(action('취소', view.close), action('자동 OOC 설정 적용', () => {
       const max = Number(maxChars.value); if (!Number.isSafeInteger(max) || max < 0 || max > 50000) throw Error('자동 OOC 최대 글자수는 0~50,000 정수로 입력하세요.');
       change(next => { next.autoSettings = draftSettings(); }); view.close();
     }, null, 'oa-primary')); closeWithEscape(view);
-  }
-
-  function localPreviewContext() {
-    const editor = document.querySelector('.__chat_input_textarea[contenteditable="true"]');
-    const userText = editor?.textContent || '';
-    const modelButton = [...document.querySelectorAll('button')].find(button => button.querySelector('img[src*="/model-icon/"]') && button.getAttribute('aria-haspopup'));
-    const label = modelButton?.textContent?.trim() || '';
-    let model = { label };
-    try {
-      const chatId = location.pathname.match(/\/(?:episodes|chats|c)\/([^/?#]+)/)?.[1] || '';
-      const next = JSON.parse(document.querySelector('#__NEXT_DATA__')?.textContent || '{}');
-      const meta = next?.props?.pageProps?.fallback?.[`/v3/chats/${chatId}`]?.data;
-      if (meta) model = { crackerModel: meta.crackerModel, chatModelId: meta.chatModelId, model: meta.model, label };
-    } catch { /* 현재 표시명만 사용한다. */ }
-    return { reason: 'preview', userText, recentText: '', model };
-  }
-
-  async function standalonePreviewContext() {
-    const base = localPreviewContext(), chatId = currentChatId();
-    if (!chatId) return base;
-    const controller = new PageAbortController(), timer = setTimeout(() => controller.abort(), 3000);
-    try {
-      const [messages, room] = await Promise.all([fetchRecentMessages(chatId, controller.signal, 30), fetchRoomModel(chatId, controller.signal).catch(() => null), refreshModelCatalog(controller.signal).catch(() => [])]);
-      let frame = null; try { frame = stableCarrierFrame(messages); } catch { /* carrier 표시만 생략한다. */ }
-      await ensureRoomModelKnown(room, controller.signal);
-      return { ...base, chatId, frame, messages, userText: conditionSourceText(base.userText), recentText: visibleConversationText(messages), assistantText: frame?.latest ? visibleAssistantText(messageTextOf(frame.latest)) : null, model: currentModelContext(null, messages, room) };
-    } catch (error) {
-      console.info('[Crack OOC 보관함] 미리보기 최근 대화 조회 생략', error);
-      return { ...base, chatId };
-    } finally { clearTimeout(timer); }
   }
 
   function showConnection() {
@@ -1674,7 +1739,7 @@
       ['3. 로그인 사용자 등록하기', ['콘솔 → Authentication → 시작하기 → 로그인 방법(Sign-in method).', '이메일/비밀번호(Email/Password)를 활성화하고 저장하세요. 이메일 링크 로그인은 켜지 않아도 됩니다.', '사용자(Users) 탭 → 사용자 추가(Add user) → 사용할 이메일과 비밀번호 입력 → 등록.', '메일 계정은 실제로 존재하거나 사용하는 이메일이 아니어도 됩니다. 다른 서비스와 겹치지 않는 임의의 이메일과 비밀번호를 권장합니다.']],
       ['4. 보관함에서 로그인하기', ['가이드를 닫고 DB 연동 → Firebase → config 붙여넣기.', '등록한 이메일과 비밀번호를 입력하고 로그인을 누르세요.', '로그인됨 표시를 확인한 뒤 이 가이드를 다시 열어 아래 보안 규칙을 복사하세요.']],
       ['5. DB 접근 보안 규칙 게시하기', ['로그인한 뒤 아래 본인 UID 전용 규칙을 복사하세요.', '전용 DB라면 Realtime Database → 규칙(Rules)에서 아래 규칙으로 교체하고 게시(Publish)하세요. 기존 프로그램과 공유하는 DB라면 기존 규칙을 백업하고 rules 아래에 oocLibrary 부분만 추가하세요. 상위 경로의 공개 읽기/쓰기 규칙은 하위 규칙보다 우선하므로 그대로 두면 보호되지 않습니다.']],
-      ['6. 연결 확인 · 다른 기기에서 사용하기', ['가이드를 닫고 연동 적용을 누르세요. 양쪽에 자료가 있으면 사용할 쪽과 삭제될 쪽을 확인하세요. 중요한 자료는 먼저 설정의 전체 백업으로 보관하세요.', '다른 기기에서도 같은 config와 프로젝트에 등록한 이메일/비밀번호로 연결하세요.']]
+      ['6. 연결 확인 · 다른 기기에서 사용하기', ['가이드를 닫고 연동 적용을 누르세요. 양쪽에 자료가 있으면 사용할 쪽과 삭제될 쪽을 확인하세요.', '다른 기기에서도 같은 config와 프로젝트에 등록한 이메일/비밀번호로 연결하세요.']]
     ];
     sections.forEach(([title, steps], index) => {
       const section = node('details', 'oa-guide-section'); section.open = index === 0 || (index === 4 && !!connection?.auth?.uid); section.append(node('summary', '', title));
@@ -1798,9 +1863,9 @@
     .oa-dialog{--oa-bg:hsl(var(--card,0 0% 9%));--oa-fg:hsl(var(--foreground,0 0% 98%));--oa-muted:hsl(var(--muted-foreground,0 0% 58%));--oa-line:hsl(var(--border,0 0% 22%));--oa-accent:#a5a0f5;color:var(--oa-fg);background:var(--oa-bg);border:1px solid var(--oa-line);border-radius:16px;padding:0;width:min(520px,calc(100vw - 32px));max-height:86vh;box-shadow:0 24px 80px #0007;font:14px/1.5 system-ui}
     .oa-dialog [hidden]{display:none!important}.oa-dialog::backdrop{background:#0007}.oa-dialog.oa-large{width:min(680px,calc(100vw - 32px))}.oa-dialog.oa-guide{width:min(620px,calc(100vw - 32px))}.oa-header{display:flex;align-items:center;gap:8px;height:64px;padding:0 20px;border-bottom:1px solid var(--oa-line)}.oa-header strong{font-size:16px;font-weight:650}.oa-header>.oa-icon{margin-left:auto}.oa-actions{display:flex;gap:4px;margin-left:auto}.oa-dot{width:7px;height:7px;background:#f06b73;border-radius:50%}.oa-body{padding:20px;overflow:auto;max-height:calc(86vh - 142px)}.oa-large .oa-body{min-height:260px;max-height:calc(86vh - 66px)}.oa-footer{display:flex;justify-content:flex-end;gap:8px;padding:12px 20px;border-top:1px solid var(--oa-line)}
     .oa-dialog button{font:inherit;cursor:pointer}.oa-icon{display:inline-flex;align-items:center;justify-content:center;width:32px;height:32px;padding:6px;border:0;border-radius:6px;background:transparent;color:var(--oa-muted,currentColor);flex-shrink:0}.oa-icon svg, .oa-symbol svg,.oa-search svg,.oa-toggle svg,.oa-list-folder svg{width:20px;height:20px;display:block;flex-shrink:0}.oa-icon:hover,.oa-toggle:hover{background:#8882;color:var(--oa-fg,inherit)}.oa-dialog button:disabled{opacity:.35;cursor:default}.oa-dialog button:focus-visible,.oa-dialog summary:focus-visible{outline:2px solid var(--oa-accent);outline-offset:2px}.oa-button{border:1px solid var(--oa-line);background:transparent;color:inherit;border-radius:8px;padding:7px 14px}.oa-primary{background:var(--oa-accent);color:#171724;border-color:transparent}.oa-toolbar{display:flex;align-items:center;gap:6px;margin-bottom:14px}.oa-search{display:flex;align-items:center;gap:8px;flex:1;border:1px solid var(--oa-line);border-radius:8px;padding:0 10px;color:var(--oa-muted)}
-    .oa-dialog input,.oa-dialog textarea,.oa-dialog select{color:inherit;background:transparent;border:1px solid var(--oa-line);border-radius:8px;padding:9px 10px;font:inherit;width:100%;box-sizing:border-box;min-width:0}.oa-search input{border:0;outline:none;padding:9px 0}.oa-field{display:flex;flex-direction:column;gap:7px;margin-bottom:16px}.oa-field>span{font-size:13px;color:var(--oa-muted)}.oa-dialog textarea{resize:vertical;white-space:pre-wrap}.oa-dialog select option{color:#eee;background:#222}.oa-toggle-field{display:grid;grid-template-columns:auto 1fr;gap:4px 9px;align-items:center;margin:0 0 16px}.oa-toggle-field input{width:18px;height:18px}.oa-toggle-field small{grid-column:2;color:var(--oa-muted);line-height:1.45}.oa-hint{margin:-8px 0 14px;color:var(--oa-muted);font-size:12px;line-height:1.5}.oa-auto-editor,.oa-settings-section{border-top:1px solid var(--oa-line);padding-top:16px;margin-top:4px}.oa-settings-section{border:1px solid var(--oa-line);border-radius:10px;padding:14px;margin-bottom:22px}.oa-preview{margin-top:12px;padding:10px;border-radius:8px;background:#8881}.oa-preview strong{display:block;margin-bottom:6px}.oa-preview-list{white-space:pre-wrap}.oa-preview-list small{display:block;color:var(--oa-muted);margin-top:6px}.oa-muted{color:var(--oa-muted)}.oa-conditions-title{margin:4px 0 10px;font-size:13px;color:var(--oa-muted);font-weight:600}.oa-condition{border:1px solid var(--oa-line);border-radius:10px;padding:10px;margin-bottom:10px}.oa-condition-head{display:flex;align-items:center;gap:8px}.oa-condition-head select{flex:1}.oa-condition-number{color:var(--oa-muted);min-width:18px}.oa-condition-detail{display:flex;flex-direction:column;gap:8px;margin-top:8px}.oa-condition-detail small{color:var(--oa-muted);font-size:12px;line-height:1.5}.oa-condition-detail small.oa-condition-warning{color:#ed969e}.oa-conditions-note{margin:12px 0 0}.oa-api-fields{margin-top:4px}.oa-settings-section .oa-backup{margin-top:4px;flex-wrap:wrap}.oa-diagnostics{margin-top:12px}.oa-diagnostics summary{cursor:pointer;color:var(--oa-muted);font-size:12px}.oa-diagnostics pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#8881;border-radius:6px;padding:10px;margin:8px 0 0;font-size:11px;max-height:240px;overflow:auto}
+    .oa-dialog input,.oa-dialog textarea,.oa-dialog select{color:inherit;background:transparent;border:1px solid var(--oa-line);border-radius:8px;padding:9px 10px;font:inherit;width:100%;box-sizing:border-box;min-width:0}.oa-search input{border:0;outline:none;padding:9px 0}.oa-field{display:flex;flex-direction:column;gap:7px;margin-bottom:16px}.oa-field>span{font-size:13px;color:var(--oa-muted)}.oa-dialog textarea{resize:vertical;white-space:pre-wrap}.oa-dialog select option{color:#eee;background:#222}.oa-toggle-field{display:grid;grid-template-columns:auto 1fr;gap:4px 9px;align-items:center;margin:0 0 16px}.oa-toggle-field input{width:18px;height:18px}.oa-toggle-field small{grid-column:2;color:var(--oa-muted);line-height:1.45}.oa-hint{margin:-8px 0 14px;color:var(--oa-muted);font-size:12px;line-height:1.5}.oa-auto-editor,.oa-settings-section{border-top:1px solid var(--oa-line);padding-top:16px;margin-top:4px}.oa-settings-section{border:1px solid var(--oa-line);border-radius:10px;padding:14px;margin-bottom:22px}.oa-preview{margin-top:12px;padding:10px;border-radius:8px;background:#8881}.oa-preview strong{display:block;margin-bottom:6px}.oa-preview-list{white-space:pre-wrap}.oa-preview-list small{display:block;color:var(--oa-muted);margin-top:6px}.oa-muted{color:var(--oa-muted)}.oa-conditions-title{margin:4px 0 10px;font-size:13px;color:var(--oa-muted);font-weight:600}.oa-condition{border:1px solid var(--oa-line);border-radius:10px;padding:10px;margin-bottom:10px}.oa-condition-head{display:flex;align-items:center;gap:8px}.oa-condition-head select{flex:1}.oa-condition-number{color:var(--oa-muted);min-width:18px}.oa-condition-detail{display:flex;flex-direction:column;gap:8px;margin-top:8px}.oa-condition-detail small{color:var(--oa-muted);font-size:12px;line-height:1.5}.oa-condition-detail small.oa-condition-warning{color:#ed969e}.oa-conditions-note{margin:12px 0 0}.oa-api-fields{margin-top:4px}.oa-settings-section .oa-button-row{margin-top:4px;flex-wrap:wrap}.oa-raw{margin-top:10px}.oa-raw summary{cursor:pointer;font-size:13px}.oa-raw-stats{margin:8px 0;color:var(--oa-muted);font-size:12px;line-height:1.5}.oa-dialog textarea.oa-raw-text{font:12px/1.5 ui-monospace,SFMono-Regular,Consolas,monospace;white-space:pre-wrap;overflow-wrap:anywhere;max-height:320px;overflow:auto}.oa-raw .oa-button-row{align-items:center;margin-top:8px}.oa-diagnostics{margin-top:12px}.oa-diagnostics summary{cursor:pointer;color:var(--oa-muted);font-size:12px}.oa-diagnostics pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#8881;border-radius:6px;padding:10px;margin:8px 0 0;font-size:11px;max-height:240px;overflow:auto}
     .oa-group{margin:8px 0;border:1px solid var(--oa-line);border-radius:10px;overflow:visible}.oa-group>.oa-row{background:#8881;border-radius:9px}.oa-row{position:relative;display:flex;align-items:center;gap:9px;min-height:44px;padding:4px 8px;box-sizing:border-box}.oa-name{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.oa-group>.oa-row>.oa-name{font-weight:600;cursor:pointer}.oa-symbol{color:var(--oa-muted);flex-shrink:0}.oa-group>.oa-row>.oa-symbol{color:#c4b391}.oa-count{color:var(--oa-muted);font-size:12px}.oa-auto-badge{font-size:11px;color:#b9b5ff;border:1px solid #a5a0f555;border-radius:999px;padding:1px 6px;white-space:nowrap}.oa-review-badge{color:#ed969e;border-color:#eb6b7466}.oa-row-actions{display:flex;gap:2px}.oa-row-actions .oa-icon{width:28px;height:28px;padding:5px}.oa-row-actions .oa-icon[data-sort]{cursor:grab;touch-action:none}.oa-toggle{width:20px;height:28px;border:0;padding:0;background:transparent;color:var(--oa-muted);flex-shrink:0}.oa-toggle svg{width:16px;height:16px;transition:transform .15s}.oa-open .oa-toggle svg{transform:rotate(90deg)}.oa-children{margin:0 12px 10px 30px;padding-left:8px;border-left:2px solid var(--oa-line)}.oa-children .oa-row+.oa-row{border-top:1px solid #8882}.oa-extras{margin-top:14px}.oa-extras>.oa-row{border-bottom:1px solid #8882}.oa-empty{height:28px}.oa-before::before,.oa-after::after{content:'';position:absolute;left:0;right:0;height:3px;background:var(--oa-accent);border-radius:3px;z-index:2;pointer-events:none}.oa-before::before{top:0}.oa-after::after{bottom:0}.oa-children,.oa-extras{position:relative}.oa-dragging{opacity:.3}.oa-ghost{position:fixed;pointer-events:none;z-index:3;background:var(--oa-bg);border:1px solid var(--oa-line);border-radius:8px;box-shadow:0 8px 24px #0006;opacity:.95}
-    .oa-message{white-space:pre-line;margin:0 0 14px;line-height:1.7}.oa-warning{color:#ed969e;background:#eb6b7410;border:1px solid #eb6b7440;border-radius:8px;padding:12px}.oa-source-options{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin:14px 0}.oa-source{display:flex;flex-direction:column;align-items:flex-start;gap:8px;padding:14px}.oa-source span{font-size:12px;color:var(--oa-muted)}.oa-source.oa-selected{border-color:var(--oa-accent);background:#a5a0f512}.oa-backup{display:flex;gap:8px}.oa-body h3{margin:0 0 14px;font-size:14px}.oa-db-top{display:flex;align-items:center;gap:8px;margin-bottom:16px}.oa-segment{display:flex;padding:3px;border-radius:9px;background:#8882;flex:1}.oa-segment label{flex:1;text-align:center;cursor:pointer}.oa-segment input{position:absolute;opacity:0;width:1px;height:1px}.oa-segment span{display:block;border-radius:6px;padding:7px 12px;color:var(--oa-muted)}.oa-segment input:checked+span{color:var(--oa-fg);background:var(--oa-bg);box-shadow:0 1px 4px #0003}.oa-segment input:focus-visible+span{outline:2px solid var(--oa-accent)}.oa-credentials{display:grid;grid-template-columns:minmax(0,1.2fr) minmax(0,1fr) auto;gap:8px;align-items:center}.oa-credentials .oa-button{padding:9px 12px}.oa-auth-state{font-size:12px;color:var(--oa-muted);min-height:18px;margin:10px 0 0}.oa-guide-section{border-bottom:1px solid var(--oa-line);padding:12px 0}.oa-guide-section:first-child{padding-top:0}.oa-guide-section summary{cursor:pointer;font-weight:600}.oa-guide-section ol{padding-left:23px}.oa-guide-section li{margin:8px 0;line-height:1.7}.oa-guide-section pre{white-space:pre-wrap;background:#8881;border-radius:6px;padding:10px;font-size:12px}.oa-guide-section small{color:var(--oa-muted);overflow-wrap:anywhere}
+    .oa-message{white-space:pre-line;margin:0 0 14px;line-height:1.7}.oa-warning{color:#ed969e;background:#eb6b7410;border:1px solid #eb6b7440;border-radius:8px;padding:12px}.oa-source-options{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin:14px 0}.oa-source{display:flex;flex-direction:column;align-items:flex-start;gap:8px;padding:14px}.oa-source span{font-size:12px;color:var(--oa-muted)}.oa-source.oa-selected{border-color:var(--oa-accent);background:#a5a0f512}.oa-button-row{display:flex;gap:8px}.oa-body h3{margin:0 0 14px;font-size:14px}.oa-db-top{display:flex;align-items:center;gap:8px;margin-bottom:16px}.oa-segment{display:flex;padding:3px;border-radius:9px;background:#8882;flex:1}.oa-segment label{flex:1;text-align:center;cursor:pointer}.oa-segment input{position:absolute;opacity:0;width:1px;height:1px}.oa-segment span{display:block;border-radius:6px;padding:7px 12px;color:var(--oa-muted)}.oa-segment input:checked+span{color:var(--oa-fg);background:var(--oa-bg);box-shadow:0 1px 4px #0003}.oa-segment input:focus-visible+span{outline:2px solid var(--oa-accent)}.oa-credentials{display:grid;grid-template-columns:minmax(0,1.2fr) minmax(0,1fr) auto;gap:8px;align-items:center}.oa-credentials .oa-button{padding:9px 12px}.oa-auth-state{font-size:12px;color:var(--oa-muted);min-height:18px;margin:10px 0 0}.oa-guide-section{border-bottom:1px solid var(--oa-line);padding:12px 0}.oa-guide-section:first-child{padding-top:0}.oa-guide-section summary{cursor:pointer;font-weight:600}.oa-guide-section ol{padding-left:23px}.oa-guide-section li{margin:8px 0;line-height:1.7}.oa-guide-section pre{white-space:pre-wrap;background:#8881;border-radius:6px;padding:10px;font-size:12px}.oa-guide-section small{color:var(--oa-muted);overflow-wrap:anywhere}
     .oa-native-hidden{display:none!important}.oa-tabs{overflow-x:auto!important;overflow-y:hidden!important;flex-wrap:nowrap!important}.oa-tab{background:transparent;border:0;border-bottom:2px solid transparent;padding:0 8px 8px;margin-bottom:-1px;flex-shrink:0;font-size:14px;font-weight:var(--oa-tab-weight,400);color:var(--oa-tab-color,inherit);white-space:nowrap;border-radius:0}.oa-tab.oa-tab-active{border-bottom-color:currentColor;font-weight:var(--oa-tab-active-weight,600);color:var(--oa-tab-active-color,inherit)}.oa-panel-config{width:28px;height:28px;margin-bottom:6px}.oa-panel-body{min-height:0;flex:1;overflow:auto;padding:8px 16px;font-size:14px}.oa-panel-body[hidden]{display:none}.oa-use{display:block;border:0;background:transparent;color:inherit;padding:8px;width:100%;text-align:left;border-radius:6px;font-size:14px}.oa-use:hover{background:#8882}.oa-list-folder summary{display:flex;align-items:center;gap:8px;padding:8px 0;cursor:pointer;font-weight:600;list-style:none}.oa-list-folder summary::-webkit-details-marker{display:none}.oa-list-folder summary svg:first-child{width:14px;height:14px}.oa-list-folder[open] summary svg:first-child{transform:rotate(90deg)}.oa-list-folder>.oa-use{margin-left:20px;width:calc(100% - 20px);padding-left:12px;border-left:2px solid #8884;border-radius:0}
     @media(max-width:480px){.oa-header{padding:0 12px}.oa-body{padding:14px}.oa-row-actions{gap:0}.oa-children{margin-left:22px}.oa-credentials{gap:5px}.oa-credentials input{padding:8px 6px}.oa-credentials .oa-button{padding:8px}.oa-source-options{gap:6px}.oa-source{padding:10px}}
   `; document.head.append(styles);
