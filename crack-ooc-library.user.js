@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Crack OOC 보관함
 // @namespace    crack.ooc.library
-// @version      3.0.2.1
+// @version      3.0.3.0
 // @description  OOC를 보관하고 안전한 assistant carrier에 독립적으로 자동 컨텍스트를 주입 (version 관리방식: 데이터구조버전.크랙UI변경.기능추가및수정.버그수정)
 // @match        https://crack.wrtn.ai/*
 // @noframes
@@ -54,6 +54,8 @@
  * - WRMC가 감지되면 WRMC stableFrame이 고를 carrier와 WISH marker가 있는 메시지를 피해 별도 carrier를 쓴다.
  * - 3.0.2.0: 독립 carrier가 없으면 RP Manager가 쓰는 답변을 함께 쓴다 (shared). 서버의 지금 본문 전체를 그대로 두고 맨 뒤에 AUTO 구간만 붙였다 뗀다.
  * - 함께 쓸 답변도 없거나 어떤 단계든 실패하면 그 generation의 자동 OOC만 건너뛰고 원래 전송은 그대로 보낸다.
+ * - 3.0.3.0: 상황 감지는 입력하는 동안 미리 받아 둔다. 새 USER를 보내는 전송은 그 결과만 쓰고 전송 시점에 API를 부르지 않는다.
+ *   입력 상자 위의 "이번 턴 OOC"에서 이번 턴에만 넣고 뺄 수 있다 (메모리에만 두며 자료에 저장하지 않는다).
  * - 3.0.2.1: generation 요청은 send / reroll / continue("이어서 생성") 셋이다. 서버의 마지막 메시지가 USER인 채로 오는 continue는
  *   그 USER에 답하는 정상 요청이다 (답을 지우고 다시 만들 때). 이때는 남아 있는 과거 AI 답변이 모두 carrier 후보다.
  * - hook 설치 순서(WRMC/에리 wrapper의 안쪽·바깥쪽)는 동작 조건이 아니다. 실제 위치는 진단에만 표시한다.
@@ -103,11 +105,14 @@
   // 판정에 보내는 최근 메시지 수와 응답을 기다리는 시간. 설정으로 바꿀 수 없다.
   const SITUATION_CONTEXT_MESSAGES = 6;
   const SITUATION_TIMEOUT_MS = 3000;
+  // 입력이 멈춘 뒤 이번 턴 OOC를 다시 계산하기까지 기다리는 시간, 그리고 그 계산에 쓰는 최근 대화·방 정보를 다시 읽지 않고 쓰는 시간.
+  const TURN_DEBOUNCE_MS = 800;
+  const TURN_CONTEXT_MAX_AGE_MS = 15000;
   const SITUATION_DEFAULTS = Object.freeze({ provider: 'off', googleModel: SITUATION_MODELS[0].ids[0], firebaseModel: SITUATION_MODELS[0].ids[0], firebaseLocation: 'global' });
   const MODEL_CACHE_KEY = 'crack-ooc-library.chat-models.v2';
   const MODEL_CACHE_MAX_AGE_MS = 6 * 60 * 60 * 1000;
-  // Crack chat-models API가 받는 serviceType 값과 dropdown 묶음 이름.
-  const MODEL_SERVICES = [['story', '스토리'], ['character', '캐릭터'], ['partyChat', '파티챗']];
+  // Crack chat-models API가 받는 serviceType 값. 같은 모델이 여러 서비스에 나오면 앞의 것을 쓴다.
+  const MODEL_SERVICES = ['story', 'character', 'partyChat'];
   const LEGACY_MODEL_OPTION = '__legacy__';
   // 값이 적혀 있지 않을 때만 쓰는 기본값이다 (새 보관함, 새 OOC). 저장된 false를 true로 바꾸지 않는다.
   const AUTO_DEFAULTS = Object.freeze({ enabled: true, conditions: Object.freeze([]) });
@@ -334,7 +339,7 @@
         value.updatedAt = Math.max(Date.now(), (stamp || 0) + 1);
         await firebase(settings, 'PUT', '', transport(value, 'write'));
       } else { value.updatedAt = Math.max(Date.now(), library.updatedAt + 1); await localData(value); }
-      library = value; editing = null; drawPanels();
+      library = value; editing = null; drawPanels(); scheduleTurn('library', 0);
     } finally { saving = false; drawManager(); }
   }
 
@@ -429,9 +434,9 @@
   function refreshModelCatalog(signal, force = false) {
     if (!force && modelCatalog.length && Date.now() - modelCatalogAt < MODEL_CACHE_MAX_AGE_MS) return Promise.resolve(modelCatalog);
     if (!modelCatalogLoading) modelCatalogLoading = (async () => {
-      const lists = await Promise.all(MODEL_SERVICES.map(([service]) => crackRequest('GET', `https://crack-api.wrtn.ai/crack-gen/v3/chat-models?serviceType=${service}`, undefined, signal)
+      const lists = await Promise.all(MODEL_SERVICES.map(service => crackRequest('GET', `https://crack-api.wrtn.ai/crack-gen/v3/chat-models?serviceType=${service}`, undefined, signal)
         .then(response => catalogRows(response?.data?.models ?? response?.models, service), () => null)));
-      const failed = MODEL_SERVICES.filter((_, index) => lists[index] === null).map(([service]) => service), rows = lists.flatMap(list => list || []);
+      const failed = MODEL_SERVICES.filter((_, index) => lists[index] === null), rows = lists.flatMap(list => list || []);
       if (rows.length) {
         // 일부 묶음만 실패했으면 그 묶음은 예전 목록을 유지하고 다음에 다시 시도한다.
         modelCatalog = [...rows, ...modelCatalog.filter(row => failed.includes(row.service))]; modelCatalogAt = failed.length ? 0 : Date.now(); modelCatalogFetchedAt = Date.now();
@@ -449,14 +454,20 @@
     modelCatalogForcedAt = now;
     await refreshModelCatalog(signal, true).catch(() => []);
   }
-  // dropdown용 목록 하나. key가 같은 행은 하나로 합치고(다른 서비스에 같은 모델이 또 나와도 한 번만), 스토리 밖의 모델은
-  // 어디 것인지 이름 뒤에 붙인다. selectable은 지금 Crack에서 고를 수 있는 유료 모델이다: 판매 종료(retired)와 무료(free) 행만 남은 모델은 빠진다.
+  // dropdown용 목록 하나. 어느 서비스(스토리·캐릭터·파티챗)의 모델인지는 표시하지 않고, key(crackerModel)가 같은 행은 하나로 합친다.
+  // 이름까지 같은 다른 key가 있으면 한 줄만 고를 수 있게 한다 (모델 조건은 key와 이름 둘 다로 비교하므로 어느 쪽 모델이든 맞는다).
+  // selectable은 지금 Crack에서 고를 수 있는 유료 모델이다: 판매 종료(retired)와 무료(free) 행만 남은 모델은 빠진다.
   function modelOptions() {
-    const byKey = new Map();
-    for (const [service, serviceLabel] of MODEL_SERVICES) for (const row of modelCatalog.filter(item => item.service === service)) {
+    const byKey = new Map(), names = new Set();
+    for (const service of MODEL_SERVICES) for (const row of modelCatalog.filter(item => item.service === service)) {
       const live = !row.retired && !row.free, known = byKey.get(row.key);
-      if (!known) byKey.set(row.key, { key: row.key, name: row.name, label: service === 'story' ? row.name : `${row.name} (${serviceLabel})`, retired: row.retired, free: !!row.free, selectable: live });
-      else if (!known.selectable && live) Object.assign(known, { name: row.name, retired: false, free: false, selectable: true });
+      if (!known) byKey.set(row.key, { key: row.key, name: row.name, label: row.name, retired: row.retired, free: !!row.free, selectable: live });
+      else if (!known.selectable && live) Object.assign(known, { name: row.name, label: row.name, retired: false, free: false, selectable: true });
+    }
+    for (const option of byKey.values()) {
+      if (!option.selectable) continue;
+      const name = modelText(option.name);
+      if (names.has(name)) Object.assign(option, { selectable: false, alias: true }); else names.add(name);
     }
     return [...byKey.values()];
   }
@@ -544,9 +555,11 @@
     const overhead = Number.isFinite(Number(request.overhead)) ? Math.max(0, Number(request.overhead)) : autoRegionOverhead();
     const modelDetected = modelValues(request.model).length > 0;
     if (!configured.autoInjectionEnabled || !GENERATION_EVENTS.some(event => request.reason === `before-${event}`) || maxChars <= 0) return { block: '', selected: [], matched: [], omitted: [], maxChars, chars: 0, modelDetected };
-    const seen = new Set(), omitted = [], summary = row => ({ id: row.entry.id, name: row.entry.name, libraryOrder: row.order + 1 });
-    const candidates = allEntries(data).map((entry, order) => ({ entry, order, rendered: renderAutoItem(entry) }))
-      .filter(row => row.entry.autoInjection.enabled && row.rendered && entryMatches(row.entry, request))
+    // request.overrides(OOC id → 넣음/뺌)는 사용자가 이번 턴에만 직접 정한 값이다. 있으면 조건 판정 대신 그 값을 쓴다. 순서와 글자수 예산은 그대로다.
+    const forced = request.overrides instanceof Map ? request.overrides : null;
+    const seen = new Set(), omitted = [], summary = row => ({ id: row.entry.id, name: row.entry.name, libraryOrder: row.order + 1, ...(row.forced === true ? { manual: true } : {}) });
+    const candidates = allEntries(data).map((entry, order) => ({ entry, order, rendered: renderAutoItem(entry), forced: forced?.get(entry.id) }))
+      .filter(row => row.entry.autoInjection.enabled && row.rendered && (row.forced ?? entryMatches(row.entry, request)))
       .filter(row => { const key = row.rendered.normalize('NFKC'); if (seen.has(key)) { omitted.push({ ...summary(row), reason: 'duplicate-content' }); return false; } seen.add(key); return true; });
     const selected = [], pieces = [], prefix = '[자동 OOC]\n', suffix = '\n[/자동 OOC]';
     for (const row of candidates) {
@@ -848,6 +861,8 @@
   function saveSituationSettings(next) {
     situationSettings = normalizeSituationSettings(next);
     try { pageStorage.setItem(SITUATION_KEY, JSON.stringify(situationSettings)); } catch {}
+    // 다른 key·모델로 다시 물어야 한다. 직접 바꾼 선택은 그대로 둔다.
+    clearTurnJudgement(); scheduleTurn('situation-api', 0);
   }
   const situationError = (code, message) => Object.assign(Error(message), { situationCode: code });
   // Crack이 아닌 외부 API 요청. 어떤 상태 코드든 응답 자체는 돌려주고 판단은 부르는 쪽이 한다. 요청 내용과 헤더는 기록하지 않는다.
@@ -1179,27 +1194,266 @@
     return { needed, room: needed ? fetchRoomModel(chatId, signal).catch(() => null) : Promise.resolve(null),
       catalog: !needed ? Promise.resolve() : modelCatalog.length ? (void refreshModelCatalog().catch(() => {}), Promise.resolve()) : refreshModelCatalog(signal).catch(() => {}) };
   }
-  // 이번 턴의 판정 한 벌: 조건 평가 → 상황 감지 → OOC 선택 → carrier 선택. 실제 전송(injectAutoOoc)과 설정의 "현재 턴 미리보기"
+  // 조건 판정에 쓰는 값들. 실제 전송, 미리보기, 입력하는 동안의 "이번 턴 OOC"가 같은 함수로 만든다.
+  // 글자수 조건의 기준은 frame.latest다. send는 방금 끝난 직전 AI 응답, reroll은 다시 만들 대상 응답이다. Crack의 reroll payload는
+  // { chatId, freeChatPassCampaignId, instruction }뿐이라 대상 id가 없고 항상 최신 AI 응답을 다시 만든다. 그래서 둘 다
+  // 목록의 최신 assistant를 읽되(주입 대상 carrier나 더 오래된 답변이 아니다), 교체되기 전의 본문을 지금 읽어 둔다.
+  // 마지막 USER에 답하는 요청에서는 지워진 답의 길이를 알 수 없다. 추측하지 않고 남아 있는 가장 가까운 이전 답을 쓴다.
+  function turnRequest(event, payload, recent, frame, userText, room) {
+    return { reason: `before-${event}`, userText, recentText: visibleConversationText(recent), assistantText: frame.latest ? visibleAssistantText(messageTextOf(frame.latest)) : null, model: currentModelContext(payload, recent, room) };
+  }
+  // 이번 턴의 판정 한 벌: 조건 평가 → 상황 판정 → 직접 바꾼 선택 → OOC 선택 → carrier 선택. 실제 전송(injectAutoOoc)과 설정의 "현재 턴 미리보기"
   // (previewTurn)가 이 함수를 같이 쓴다. 읽기와 판정만 하며 서버의 메시지는 여기서 고치지 않는다.
   async function evaluateTurn(data, turn, signal, api = situationSettings) {
-    const { event, recent, frame, userText } = turn;
-    // 글자수 조건의 기준은 frame.latest다. send는 방금 끝난 직전 AI 응답, reroll은 다시 만들 대상 응답이다. Crack의 reroll payload는
-    // { chatId, freeChatPassCampaignId, instruction }뿐이라 대상 id가 없고 항상 최신 AI 응답을 다시 만든다. 그래서 둘 다
-    // 목록의 최신 assistant를 읽되(주입 대상 carrier나 더 오래된 답변이 아니다), 교체되기 전의 본문을 지금 읽어 둔다.
-    // 마지막 USER에 답하는 요청에서는 지워진 답의 길이를 알 수 없다. 추측하지 않고 남아 있는 가장 가까운 이전 답을 쓴다.
-    const assistantText = frame.latest ? visibleAssistantText(messageTextOf(frame.latest)) : null;
+    const { event, recent, frame, userText } = turn, plan = turn.plan || EMPTY_TURN_PLAN;
     await turn.lookup.catalog;
     const room = await turn.lookup.room; await ensureRoomModelKnown(room, signal);
-    const model = currentModelContext(turn.payload, recent, room);
-    const request = { reason: `before-${event}`, userText, recentText: visibleConversationText(recent), assistantText, model };
-    // 상황 감지: 로컬 조건을 모두 통과한 OOC의 상황 문구만 모아(중복 제거) 한 번에 묻는다. 모을 것이 없으면 요청하지 않는다.
-    // 실패·시간 초과는 전부 "해당 없음"이 되어 그 OOC만 빠진다.
-    const wanted = pendingSituations(data, request), judged = wanted.size ? await judgeSituations(wanted, { recent, userText, mode: frame.mode }, signal, api) : null;
-    if (judged) request.situations = judged.situations;
+    // 모델·글자수·키워드 조건은 언제나 지금 값으로 계산한다 (입력한 뒤에 모델을 바꿨을 수 있다). 미리 받아 두는 것은 상황 판정뿐이다.
+    const request = turnRequest(event, turn.payload, recent, frame, userText, room), { assistantText, model } = request;
+    // 상황 감지: 로컬 조건을 모두 통과한 OOC의 상황 문구만 대상이다 (중복 제거). 실패는 전부 "해당 없음"이 되어 그 OOC만 빠진다.
+    // - 새 USER를 보내는 전송: 입력하는 동안 미리 받아 둔 판정만 쓴다. 여기서 API를 부르거나 기다리지 않는다. 받아 둔 것이 없는 문구는 거짓이다.
+    // - 리롤·이어서 생성: 입력창에 글이 없는 요청이다. 같은 대화로 받아 둔 판정이 있으면 쓰고, 없으면 지금 한 번 묻는다.
+    const wanted = pendingSituations(data, request); let judged = null;
+    if (wanted.size) {
+      const prefetched = frame.mode === GENERATION_MODES.send || plan.status === 'ready' && plan.key === situationCacheKey(turn.chatId, recent, userText, frame.mode, wanted, api);
+      judged = prefetched ? plannedSituations(plan, wanted, api) : await judgeSituations(wanted, { recent, userText, mode: frame.mode }, signal, api);
+      request.situations = judged.situations;
+    }
+    // 사용자가 체크리스트에서 이번 턴에만 넣거나 뺀 OOC. 자동 판정보다 우선하고, 글자수 예산은 그대로 지킨다.
+    if (plan.overrides.size) request.overrides = plan.overrides;
     const planned = selectAutoOoc(data, request);
     // WRMC가 고를 carrier를 같은 알고리즘으로 예측해 제외하고, 남은 것 중 가장 가까운 안정 assistant를 쓴다.
     const wish = detectWish(data, recent), choice = selectAutoCarrier(frame, wish.separate);
     return { request, model, assistantText, judged, planned, wish, choice };
+  }
+  // ---------------------------------------------------------------------------
+  // 이번 턴 OOC: 입력하는 동안 미리 받아 두는 상황 판정과, 사용자가 이번 턴에만 바꾼 선택
+  // ---------------------------------------------------------------------------
+  // 브라우저 메모리에만 둔다. 보관함 자료에는 쓰지 않는다.
+  // - situations: 미리 받아 둔 상황 판정 (문구 열쇠 → 참/거짓). 받아 두는 것은 이것뿐이며 모델·글자수·키워드 조건은 쓸 때마다 다시 계산한다.
+  // - overrides: 사용자가 체크리스트에서 직접 바꾼 값 (OOC id → 넣음/뺌). 자동 판정보다 우선하고, 자동 판정이 다시 돌아도 지우지 않는다.
+  //   입력을 다 지웠을 때, 방이 바뀌었을 때, generation이 이 값을 가져갔을 때만 비운다.
+  // - key: 받아 둔(또는 받는 중인) 판정이 어떤 입력에 대한 것인지. 같은 key면 다시 묻지 않는다.
+  const EMPTY_TURN_PLAN = Object.freeze({ chatId: '', key: '', status: 'idle', situations: new Map(), overrides: new Map(), info: null, message: '' });
+  const turnOoc = { chatId: '', draft: '', overrides: new Map(), situations: new Map(), key: '', status: 'idle', info: null, message: '', pending: null, abort: null,
+    context: null, view: null, timer: null, run: 0, generatingAt: 0, toasted: '', errorShown: false, watching: false, open: false, seenRaw: null, modelLabel: null };
+  const toastLog = [];
+  let turnUi = null;
+  const composerEditor = () => document.querySelector('.__chat_input_textarea[contenteditable="true"]');
+  const composerText = () => { const editor = composerEditor(); return conditionSourceText(editor?.innerText ?? editor?.textContent ?? ''); };
+  // 지금 화면에서 다음에 일어날 generation. 서버의 마지막이 답 없는 USER이고 입력창이 비어 있으면 그 USER에 답하는 "이어서 생성"이고
+  // (Crack도 빈 입력이면 continue를 보낸다) 조건은 그 USER 메시지로 본다. 아니면 입력창의 글을 새로 보내는 것이다.
+  function draftTurn(recent, composer) {
+    let event = 'send', frame = generationFrame(recent, event), userText = composer, userTextSource = 'composer';
+    if (frame.trailingUser && !composer.trim()) { event = 'continue'; frame = generationFrame(recent, event); userText = conditionSourceText(messageTextOf(frame.targetUser)); userTextSource = 'server-trailing-user'; }
+    return { event, frame, userText, userTextSource };
+  }
+  // 상황 판정 하나를 가리키는 이름: 방, 판정에 보내는 최근 대화 6개(id와 보이는 본문), 지금 입력, 물을 문구들, 그리고 어느 API·모델에 묻는지.
+  function situationCacheKey(chatId, recent, userText, mode, wanted, api = situationSettings) {
+    const lines = (recent || []).filter(message => ['user', 'assistant'].includes(messageRoleOf(message))).slice(0, SITUATION_CONTEXT_MESSAGES)
+      .map(message => [messageIdOf(message), messageRoleOf(message) === 'assistant' ? visibleAssistantText(messageTextOf(message)) : conditionSourceText(messageTextOf(message))]);
+    return JSON.stringify([api.provider, api.provider === 'firebase-vertex' ? api.firebaseModel : api.googleModel, String(chatId), mode, lines, mode === GENERATION_MODES.send ? String(userText || '').trim() : '', [...wanted.keys()].sort()]);
+  }
+  // 미리 받아 둔 판정에서 이번에 필요한 문구만 꺼낸다. 받아 둔 것이 없는 문구는 거짓이다 (판정이 끝나기를 기다리게 하지 않는다).
+  function plannedSituations(plan, wanted, api = situationSettings) {
+    const situations = new Map([...wanted.keys()].map(key => [key, plan.situations.get(key) === true])), judgedBefore = !!plan.info;
+    const error = judgedBefore ? plan.info.error : plan.status === 'pending' ? 'pending' : 'not-judged';
+    return { situations, message: plan.message || (error === 'pending' ? '아직 판정 중이었습니다.' : error === 'not-judged' ? '미리 받아 둔 판정이 없습니다.' : ''),
+      info: { provider: api.provider, model: '', ms: 0, contextMessages: SITUATION_CONTEXT_MESSAGES, timeoutMs: SITUATION_TIMEOUT_MS, ...(plan.info || {}), conditions: wanted.size,
+        matched: [...situations.values()].filter(Boolean).length, error, source: 'prefetch', status: plan.status } };
+  }
+  function clearTurnJudgement() {
+    turnOoc.abort?.abort();
+    Object.assign(turnOoc, { key: '', status: 'idle', info: null, message: '', pending: null, abort: null, situations: new Map() });
+  }
+  function resetTurn(chatId = currentChatId()) {
+    clearTurnJudgement(); turnOoc.overrides.clear();
+    Object.assign(turnOoc, { chatId, draft: '', context: null, view: null, generatingAt: 0, toasted: '', errorShown: false });
+  }
+  const peekTurnPlan = chatId => turnOoc.chatId !== chatId ? EMPTY_TURN_PLAN
+    : { chatId, key: turnOoc.key, status: turnOoc.status, situations: new Map(turnOoc.situations), overrides: new Map(turnOoc.overrides), info: turnOoc.info, message: turnOoc.message };
+  // generation frame을 가로챈 순간의 이번 턴 상태를 그 generation 몫으로 떼어 낸다. 그 뒤 화면에서 무엇을 바꾸든 이 generation의 선택은 달라지지 않는다.
+  // 다음 턴을 위해 직접 바꾼 선택과 받아 둔 판정은 비우고, 응답이 끝날 때까지는 새로 묻지 않는다.
+  function takeTurnPlan(chatId) {
+    if (turnOoc.chatId !== chatId) resetTurn(chatId);
+    const plan = peekTurnPlan(chatId);
+    clearTurnJudgement(); turnOoc.overrides.clear();
+    Object.assign(turnOoc, { draft: '', context: null, toasted: '', generatingAt: Date.now() });
+    drawTurn();
+    return plan;
+  }
+  const turnGenerating = () => turnOoc.generatingAt > 0 && Date.now() - turnOoc.generatingAt < WATCHDOG_MS;
+  function endTurnGeneration(chatId) {
+    if (!turnOoc.generatingAt || chatId && turnOoc.chatId !== String(chatId)) return;
+    Object.assign(turnOoc, { generatingAt: 0, context: null });
+    scheduleTurn('generation-ended', 1500);
+  }
+  // 체크리스트와 상황 판정에 쓰는 최근 대화·방 모델. 입력할 때마다 다시 읽지 않도록 잠깐 기억해 둔다. 조건이 하나도 없으면 읽지 않는다.
+  async function turnContext(chatId, data) {
+    const cached = turnOoc.context;
+    if (cached && cached.chatId === chatId && Date.now() - cached.at < TURN_CONTEXT_MAX_AGE_MS) return cached;
+    if (!allEntries(data).some(entry => entry.autoInjection.enabled && entry.autoInjection.conditions.length)) return { chatId, recent: [], room: null, at: 0 };
+    const controller = new PageAbortController(), timer = setTimeout(() => controller.abort(), PREPARE_TIMEOUT_MS);
+    try {
+      const lookup = startModelLookup(data, chatId, controller.signal), recent = await fetchRecentMessages(chatId, controller.signal, 50);
+      await lookup.catalog; const room = await lookup.room; await ensureRoomModelKnown(room, controller.signal);
+      return turnOoc.context = { chatId, recent, room, at: Date.now() };
+    } finally { clearTimeout(timer); }
+  }
+  // 지금 입력을 기준으로 이번 턴 OOC를 다시 계산한다. 로컬 조건은 바로 계산하고, 상황 조건은 필요한 문구만 모아 한 번 묻는다.
+  // 전송을 막거나 기다리게 하지 않는다: 이 함수는 화면과 turnOoc만 바꾸고, 전송은 그 순간의 turnOoc를 가져갈 뿐이다.
+  async function refreshTurn(data, api = situationSettings) {
+    const chatId = currentChatId(), run = ++turnOoc.run;
+    if (chatId !== turnOoc.chatId) resetTurn(chatId);
+    if (!chatId || !data || !autoActive(data)) { turnOoc.view = null; clearTurnJudgement(); drawTurn(); return; }
+    const composer = composerText();
+    // 입력을 다 지웠으면 이번 턴에 직접 바꾼 선택도 지운다.
+    if (turnOoc.draft.trim() && !composer.trim()) turnOoc.overrides.clear();
+    turnOoc.draft = composer;
+    let context = null;
+    try { context = await turnContext(chatId, data); } catch (error) { console.info('[Crack OOC 보관함] 이번 턴 OOC: 최근 대화를 읽지 못했습니다.', error); }
+    if (run !== turnOoc.run || chatId !== currentChatId()) return;
+    const recent = context?.recent || [], draft = draftTurn(recent, composer), request = turnRequest(draft.event, null, recent, draft.frame, draft.userText, context?.room || null);
+    turnOoc.view = { data, request, mode: draft.frame.mode };
+    // 미리 묻는 것은 상황 판정뿐이다. 보낼 글이 없거나(빈 입력창), 응답을 만드는 중이거나, 대화를 읽지 못했으면 묻지 않는다.
+    const wanted = pendingSituations(data, request);
+    if (!wanted.size || !context || turnGenerating() || draft.event === 'send' && !composer.trim()) { clearTurnJudgement(); drawTurn(); return; }
+    const key = situationCacheKey(chatId, recent, draft.userText, draft.frame.mode, wanted, api);
+    // 같은 대화·같은 입력·같은 문구면 다시 묻지 않는다 (받는 중이면 그 결과를 함께 기다린다).
+    if (key === turnOoc.key) { drawTurn(); return turnOoc.pending; }
+    turnOoc.abort?.abort();
+    const controller = new PageAbortController();
+    // 새 판정이 오기 전까지는 이번 턴에 이미 받아 둔 판정(situations)을 그대로 둔다. 그사이 전송하면 그것을 쓰고, 거기 없는 문구는 거짓이다.
+    Object.assign(turnOoc, { key, status: 'pending', abort: controller });
+    drawTurn();
+    return turnOoc.pending = judgeSituations(wanted, { recent, userText: draft.userText, mode: draft.frame.mode }, controller.signal, api).then(judged => {
+      if (turnOoc.key !== key || turnOoc.abort !== controller) return;
+      Object.assign(turnOoc, { status: judged.info.error ? 'error' : 'ready', situations: judged.situations, info: judged.info, message: judged.message || '', pending: null, abort: null });
+      announceTurn(); drawTurn();
+    });
+  }
+  // 입력이 멈춘 뒤 한 번만 다시 계산한다. 화면이 준비된 뒤에만 스스로 움직인다.
+  function scheduleTurn(reason, delay = TURN_DEBOUNCE_MS) {
+    if (!turnOoc.watching) return;
+    clearTimeout(turnOoc.timer);
+    turnOoc.timer = setTimeout(() => {
+      turnOoc.timer = null;
+      readLibrary().then(data => refreshTurn(data)).catch(error => console.info('[Crack OOC 보관함] 이번 턴 OOC를 갱신하지 못했습니다.', { reason, error }));
+    }, delay);
+  }
+  function setTurnOverride(id, checked) { turnOoc.overrides.set(String(id), !!checked); drawTurn(); }
+  const TURN_KINDS = { model: '모델', assistantLength: '글자수', keyword: '키워드', situation: '상황' };
+  // 체크리스트 한 벌. 자동주입을 켠 OOC 전부를 보관함 순서대로 보여 준다.
+  // automatic은 지금 조건으로 본 자동 판정, checked는 실제로 쓰일 값(직접 바꾼 것이 있으면 그 값)이다.
+  function turnChecklist() {
+    const view = turnOoc.view; if (!view) return null;
+    const request = { ...view.request, situations: turnOoc.situations }, kinds = conditions => [...new Set(conditions.map(condition => TURN_KINDS[condition.type] || '기타'))].join(' + '), rows = [];
+    for (const entry of allEntries(view.data)) {
+      const rule = entry.autoInjection; if (!rule.enabled || !renderAutoItem(entry)) continue;
+      const conditions = orderedConditions(rule), failed = conditions.filter(condition => !conditionHolds(condition, request)), local = failed.filter(condition => condition.type !== 'situation');
+      const automatic = !failed.length, manual = turnOoc.overrides.has(entry.id), checked = manual ? turnOoc.overrides.get(entry.id) : automatic;
+      const waiting = failed.some(condition => condition.type === 'situation' && !turnOoc.situations.has(situationKey(condition.value)));
+      let note = !conditions.length ? '항상' : automatic ? kinds(conditions) : local.length ? `${kinds(local)} 불일치`
+        : waiting ? (turnOoc.status === 'pending' ? '상황 판정 중…' : '상황 판정 전') : turnOoc.status === 'error' ? '상황 감지 실패' : '상황 불일치';
+      if (manual) note += checked ? ' · 직접 선택' : ' · 직접 뺌';
+      rows.push({ id: entry.id, name: entry.name, automatic, checked, manual, note });
+    }
+    const chosen = selectAutoOoc(view.data, { ...request, overrides: turnOoc.overrides });
+    return { rows, checked: rows.filter(row => row.checked).length, injected: chosen.selected.length, status: turnOoc.status, error: turnOoc.info?.error || '' };
+  }
+  // 상황 판정으로 실제로 켜진 OOC가 있고 그 목록이 달라졌을 때만 알린다. 같은 결과가 이어지는 동안에는 다시 알리지 않는다.
+  function announceTurn() {
+    const view = turnOoc.view; if (!view) return;
+    if (turnOoc.status === 'error') {
+      // 공급자를 "사용 안 함"으로 둔 것은 실패가 아니다. 실패 알림은 이어지는 동안 한 번만 띄운다.
+      if (turnOoc.info?.error !== 'off' && !turnOoc.errorShown) { turnOoc.errorShown = true; showToast('상황 감지 실패 · 상황 조건 OOC는 적용되지 않습니다.'); }
+      return;
+    }
+    turnOoc.errorShown = false;
+    const request = { ...view.request, situations: turnOoc.situations };
+    const picked = allEntries(view.data).filter(entry => entry.autoInjection.enabled && renderAutoItem(entry) && turnOoc.overrides.get(entry.id) !== false
+      && entry.autoInjection.conditions.some(condition => condition.type === 'situation') && entryMatches(entry, request));
+    const signature = picked.map(entry => entry.id).join('\n');
+    if (signature && signature !== turnOoc.toasted) showToast(`자동 OOC · 상황 감지\n「${picked[0].name}」${picked.length > 1 ? ` 외 ${picked.length - 1}개` : ''} 선택`);
+    turnOoc.toasted = signature;
+  }
+  // ---- 이번 턴 OOC 화면: 입력 상자 바로 위의 작은 버튼과, 누르면 펼쳐지는 체크리스트 ----
+  // Crack의 화면 구조에 끼워 넣지 않고 입력 상자 위치에 맞춰 띄운다 (Crack이 화면을 다시 그려도 사라지지 않고, 입력 영역을 밀어내지 않는다).
+  function turnAnchor() {
+    const editor = composerEditor(); if (!editor?.getBoundingClientRect) return null;
+    // 둥근 테두리의 입력 상자(편집기를 감싼 가까운 조상)가 있으면 그 위에 맞춘다.
+    let box = editor, parent = editor.parentElement;
+    for (let depth = 0; parent && depth < 5; depth++, parent = parent.parentElement) {
+      const rect = parent.getBoundingClientRect();
+      if (rect.height > 320 || rect.width > innerWidth) break;
+      if (parseFloat(getComputedStyle(parent).borderTopLeftRadius) > 0) box = parent;
+    }
+    const rect = box.getBoundingClientRect();
+    return rect.width && rect.height ? rect : null;
+  }
+  function placeTurnUi() {
+    if (!turnUi || turnUi.root.hidden) return;
+    const rect = turnAnchor(); if (!rect) { turnUi.root.hidden = true; return; }
+    turnUi.root.style.right = `${Math.max(8, innerWidth - rect.right)}px`; turnUi.root.style.bottom = `${Math.max(8, innerHeight - rect.top + 6)}px`;
+  }
+  function ensureTurnUi() {
+    if (turnUi?.root.isConnected) return turnUi;
+    const root = node('div', 'oa-turn'), chip = node('button', 'oa-turn-chip'), list = node('div', 'oa-turn-list');
+    chip.type = 'button'; list.hidden = true; list.setAttribute('role', 'group'); list.setAttribute('aria-label', '이번 턴 OOC');
+    // 눌러도 입력창의 포커스와 커서는 그대로 둔다.
+    root.addEventListener('pointerdown', event => event.preventDefault());
+    chip.addEventListener('click', () => { turnOoc.open = !turnOoc.open; drawTurn(); });
+    list.addEventListener('change', event => { const id = event.target?.dataset?.oaEntry; if (id) setTurnOverride(id, event.target.checked); });
+    root.append(list, chip); document.body.append(root);
+    return turnUi = { root, chip, list };
+  }
+  function drawTurn() {
+    if (!turnOoc.watching) return;
+    const state = turnChecklist();
+    if (!state || !state.rows.length || !turnAnchor()) { if (turnUi) turnUi.root.hidden = true; return; }
+    const ui = ensureTurnUi(), scroll = ui.list.scrollTop;
+    const status = state.status === 'pending' ? '판정 중…' : state.status === 'error' ? (state.error === 'off' ? '상황 감지 꺼짐' : '상황 감지 실패') : '';
+    // 체크한 것이 글자수 한도 때문에 다 들어가지 못하면 둘 다 보여 준다.
+    ui.chip.textContent = ['이번 턴 OOC', state.checked > state.injected ? `선택 ${state.checked} · 주입 ${state.injected}` : String(state.injected), status].filter(Boolean).join(' · ');
+    ui.chip.setAttribute('aria-expanded', String(turnOoc.open)); ui.list.hidden = !turnOoc.open;
+    if (turnOoc.open) {
+      const foot = node('div', 'oa-turn-foot'), manual = state.rows.filter(row => row.manual).length;
+      foot.append(node('span', '', manual ? `직접 바꾼 ${manual}개는 이번 턴에만 적용됩니다.` : '체크한 OOC가 다음 생성에 들어갑니다.'));
+      if (manual) { const undo = node('button', '', '자동으로'); undo.type = 'button'; undo.title = '직접 바꾼 선택을 지우고 자동 판정으로 돌아갑니다'; undo.addEventListener('click', () => { turnOoc.overrides.clear(); drawTurn(); }); foot.append(undo); }
+      ui.list.replaceChildren(node('div', 'oa-turn-head', '이번 턴 OOC'), ...state.rows.map(row => {
+        const label = node('label', `oa-turn-row${row.manual ? ' oa-turn-manual' : ''}`), box = node('input'); box.type = 'checkbox'; box.checked = row.checked; box.dataset.oaEntry = row.id;
+        label.append(box, node('span', 'oa-turn-name', row.name), node('small', '', row.note)); return label;
+      }), foot);
+      ui.list.scrollTop = scroll;
+    }
+    ui.root.hidden = false; placeTurnUi();
+  }
+  function showToast(text) {
+    toastLog.push(text); while (toastLog.length > 20) toastLog.shift();
+    if (!turnOoc.watching) return;
+    document.querySelectorAll('.oa-toast').forEach(element => element.remove());
+    const toast = node('div', 'oa-toast', text), rect = turnAnchor(); toast.setAttribute('role', 'status');
+    toast.style.right = `${Math.max(8, rect ? innerWidth - rect.right : 8)}px`; toast.style.bottom = `${Math.max(8, rect ? innerHeight - rect.top + 40 : 8)}px`;
+    document.body.append(toast); setTimeout(() => toast.remove(), 3200);
+  }
+  // 화면에서 바뀐 것을 가볍게 살핀다: 방, 모델 선택, 입력창의 글(편집기가 input 이벤트 없이 글을 바꾸는 경우 포함), 입력 상자의 위치.
+  function watchTurnPage() {
+    const chatId = currentChatId(), raw = composerEditor()?.textContent ?? '', label = semanticModelLabel();
+    if (chatId !== turnOoc.chatId) { resetTurn(chatId); turnOoc.seenRaw = raw; turnOoc.modelLabel = label; drawTurn(); scheduleTurn('chat', 300); return; }
+    // 모델을 바꾸면 Crack이 방의 chatModelId를 고친다. 기억해 둔 방 정보를 버리고 체크리스트를 다시 계산한다.
+    // 모델+상황 조건처럼 물어볼 문구 자체가 달라지면 상황 판정도 새로 받는다. 직접 바꾼 선택은 건드리지 않는다.
+    if (label !== turnOoc.modelLabel) { const first = turnOoc.modelLabel === null; turnOoc.modelLabel = label; if (!first) { turnOoc.context = null; scheduleTurn('model'); } }
+    if (raw !== turnOoc.seenRaw) { turnOoc.seenRaw = raw; scheduleTurn('draft'); }
+    if (turnUi && !turnUi.root.hidden) placeTurnUi(); else if (turnOoc.view && turnAnchor()) drawTurn();
+  }
+  function startTurnUi() {
+    turnOoc.watching = true;
+    // 입력창의 글이 바뀌면 잠시 뒤(입력이 멈춘 뒤) 한 번 다시 계산한다.
+    for (const type of ['input', 'compositionend', 'paste', 'cut']) document.addEventListener(type, event => { if (event.target?.closest?.('.__chat_input_textarea')) { turnOoc.seenRaw = composerEditor()?.textContent ?? ''; scheduleTurn(type); } }, true);
+    document.addEventListener('pointerdown', event => { if (turnOoc.open && turnUi && !turnUi.root.contains(event.target)) { turnOoc.open = false; drawTurn(); } }, true);
+    W.addEventListener?.('resize', placeTurnUi);
+    setInterval(watchTurnPage, 700);
+    scheduleTurn('start', 300);
   }
   // carrier의 지금 본문에서 PATCH에 실을 본문을 만든다. 실제 주입과 미리보기가 이 함수 하나로 같은 글을 만든다.
   // 어느 방식이든 지금 서버 본문을 그대로 두고 맨 뒤에 AUTO 구간 하나를 붙인다 (남아 있던 자기 AUTO 구간만 뺀다).
@@ -1218,7 +1472,7 @@
   // shared carrier의 PATCH 뒤 확인: 우리가 쓴 뒤 다른 도구가 같은 메시지를 또 고쳤더라도, 전에 있던 RP 블록 marker가 줄지 않았고
   // AI가 쓴 본문이 그대로면 잃은 것이 없다.
   const externalIntact = (before, observed) => wishMarkerCount(observed) >= wishMarkerCount(before) && visibleAssistantText(observed) === visibleAssistantText(before);
-  async function injectAutoOoc(parsed, signal, socket = null, diag = {}) {
+  async function injectAutoOoc(parsed, signal, socket = null, diag = {}, plan = EMPTY_TURN_PLAN) {
     const skip = reason => { diag.skipReason = reason; return null; };
     const data = await abortable(readLibrary(), signal);
     if (!autoActive(data)) return skip('auto-ooc-off');
@@ -1250,7 +1504,7 @@
     const userText = conditionSourceText(userTextSource === 'payload' ? payloadText : userTextSource === 'unknown' ? '' : messageTextOf(frame.latestUser)), targetUserText = messageTextOf(frame.targetUser);
     Object.assign(diag, { userTextSource, assistantMessageId: messageIdOf(frame.latest),
       assistantSource: !frame.latest ? 'none' : frame.trailingUser ? 'previous-assistant-before-trailing-user' : frame.mode === GENERATION_MODES.reroll ? 'reroll-target' : 'latest' });
-    const { request, model, assistantText, judged, planned, wish, choice } = await evaluateTurn(data, { event: parsed.event, payload: parsed.payload, recent, frame, userText, lookup }, signal);
+    const { request, model, assistantText, judged, planned, wish, choice } = await evaluateTurn(data, { event: parsed.event, chatId, payload: parsed.payload, recent, frame, userText, lookup, plan }, signal);
     if (judged) diag.situation = judged.info;
     Object.assign(diag, { assistantChars: assistantText === null ? null : assistantText.length, userChars: userText.length, modelDetected: planned.modelDetected, matched: planned.matched, selected: planned.selected, omitted: planned.omitted, bundleChars: planned.chars });
     if (lookup.needed) diag.model = { source: model.source, crackerModel: model.crackerModel, chatModelId: model.chatModelId, name: model.name || model.label };
@@ -1309,20 +1563,21 @@
   // PATCH, 복구 기록, live 등록, cleanup을 하지 않는다. carrier에 예전 AUTO 구간이 남아 있어도 지우지 않고 계산에서만 뺀다
   // (실제 전송은 보내기 전에 지운다). generation id 자리에는 실제로 쓰이지 않는 PREVIEW_GENERATION_ID가 들어간다.
   async function previewTurn(data, api = situationSettings) {
-    const editor = document.querySelector('.__chat_input_textarea[contenteditable="true"]'), composer = conditionSourceText(editor?.innerText ?? editor?.textContent ?? '');
-    const shown = { chatId: currentChatId(), userText: composer, userTextSource: 'composer', generationMode: '', targetUserId: '', reason: '', error: '', turn: null, carrier: null, maxChars: normalizeSettings(data.autoSettings).autoOocMaxChars };
+    const composer = composerText();
+    const shown = { chatId: currentChatId(), userText: composer, userTextSource: 'composer', generationMode: '', targetUserId: '', overrides: new Map(), reason: '', error: '', turn: null, carrier: null, maxChars: normalizeSettings(data.autoSettings).autoOocMaxChars };
     const stop = (reason, error = '') => Object.assign(shown, { reason, error });
     if (!autoActive(data)) return stop('auto-ooc-off');
     if (!shown.chatId) return stop('no-chat');
     const controller = new PageAbortController(), timer = setTimeout(() => controller.abort(), PREPARE_TIMEOUT_MS), signal = controller.signal;
     try {
       const lookup = startModelLookup(data, shown.chatId, signal), recent = await fetchRecentMessages(shown.chatId, signal, 50);
-      // 서버의 마지막이 답 없는 USER이고 입력창이 비어 있으면, 지금 할 수 있는 것은 그 USER에 답하는 "이어서 생성"이다 (Crack도 빈 입력이면 continue를 보낸다).
-      // 조건은 그 USER 메시지로 판정한다. 입력창에 글이 있으면 그 글을 새로 보내는 것으로 본다.
-      let event = 'send', frame = generationFrame(recent, event);
-      if (frame.trailingUser && !composer.trim()) { event = 'continue'; frame = generationFrame(recent, event); Object.assign(shown, { userText: conditionSourceText(messageTextOf(frame.targetUser)), userTextSource: 'server-trailing-user' }); }
-      Object.assign(shown, { generationMode: frame.mode, targetUserId: messageIdOf(frame.targetUser) });
-      const turn = shown.turn = await evaluateTurn(data, { event, payload: null, recent, frame, userText: shown.userText, lookup }, signal, api);
+      const { event, frame, userText, userTextSource } = draftTurn(recent, composer);
+      Object.assign(shown, { userText, userTextSource, generationMode: frame.mode, targetUserId: messageIdOf(frame.targetUser) });
+      // 미리보기는 "지금 이대로 생성하면"을 보여 준다. 이번 턴 OOC와 같은 상황 판정(같은 입력이면 다시 묻지 않는다)과 직접 바꾼 선택을 쓴다.
+      // 누른 사람이 결과를 기다리는 화면이므로 판정이 끝날 때까지 기다린다. 실제 전송은 기다리지 않는다.
+      await refreshTurn(data, api);
+      const plan = peekTurnPlan(shown.chatId); shown.overrides = plan.overrides;
+      const turn = shown.turn = await evaluateTurn(data, { event, chatId: shown.chatId, payload: null, recent, frame, userText, lookup, plan }, signal, api);
       if (!turn.planned.block) return stop(turn.planned.matched.length ? 'over-budget' : 'no-matching-ooc');
       if (!turn.choice.carrier) return stop(!frame.stable.length ? 'no-stable-assistant' : turn.choice.rejected.every(row => row.reason === 'empty-body') ? 'carrier-empty' : 'no-independent-carrier');
       const message = await fetchCarrierMessage(shown.chatId, turn.choice.carrierId, signal);
@@ -1333,7 +1588,8 @@
       return shown;
     } catch (error) {
       return error?.code === 'AUTO_OOC_SKIP' ? stop(error.reason) : stop('lookup-failed', String(error?.message || error).slice(0, 160));
-    } finally { clearTimeout(timer); }
+    // 미리보기는 저장하지 않은 설정으로도 계산한다. 끝나면 이번 턴 OOC를 저장된 보관함 기준으로 되돌린다.
+    } finally { clearTimeout(timer); scheduleTurn('preview', 0); }
   }
   const STREAM_CHUNK_PATTERN = /^42(?:\/v3\/chats,)?\d*\["characterMessageGenerating"/;
   const COMPLETED_FRAME_PATTERN = /^42(?:\/v3\/chats,)?\d*\["characterMessageGenerated"/;
@@ -1355,11 +1611,12 @@
         }
         touchLiveResidues(); return;
       }
-      if (!live.size && !COMPLETED_FRAME_PATTERN.test(data)) return;
+      if (!live.size && !turnOoc.generatingAt && !COMPLETED_FRAME_PATTERN.test(data)) return;
       const parsed = parseSocketFrame(data); if (!parsed) return;
       const reason = parsed.event === 'characterMessageGenerated' ? 'generation-completed' : /cancel/i.test(parsed.event) ? 'generation-cancelled' : /(?:error|failed)/i.test(parsed.event) ? 'generation-error' : '';
       if (!reason) return;
       const chatId = String(parsed.payload?.data?.chatId || parsed.payload?.chatId || '');
+      endTurnGeneration(chatId);
       endGenerations(reason, row => chatId ? String(row.chatId) === chatId : live.get(row.generationId)?.socket === socket);
     });
     socket.addEventListener('close', () => scheduleCleanup('socket-close', row => live.get(row.generationId)?.socket === socket || staleEnough(row)));
@@ -1384,16 +1641,18 @@
       watchAutoSocket(this);
       const parsed = parseSocketFrame(data), chatId = String(parsed?.payload?.chatId || parsed?.payload?.data?.chatId || '');
       // 사용자가 생성을 멈추면 Crack은 { chatId }만 담은 stop을 보낸다. frame은 그대로 넘기고, 남은 block은 잠시 뒤 정리한다.
-      if (parsed?.event === 'stop' && chatId) endGenerations('generation-stopped', row => String(row.chatId) === chatId, 1000);
+      if (parsed?.event === 'stop' && chatId) { endGenerations('generation-stopped', row => String(row.chatId) === chatId, 1000); endTurnGeneration(chatId); }
       if (!parsed || !GENERATION_EVENTS.includes(parsed.event) || !chatId || chatId !== currentChatId()) return previousSend.call(this, data);
       if (library && !autoActive(library)) return previousSend.call(this, data);
       // 가로챈 frame은 어떤 경우에도 버리지 않는다. 같은 방의 frame은 들어온 순서대로 내보내고,
       // 앞선 generation이 진행 중이면 뒤 frame은 자동 OOC 없이 그대로 넘긴다 (block은 generation당 하나).
-      const socket = this, previous = sendQueues.get(chatId) || Promise.resolve();
+      // 이번 턴 OOC(미리 받아 둔 상황 판정, 직접 바꾼 선택)는 frame을 가로챈 지금 값으로 고정한다. 뒤에서 기다리는 동안 화면이 바뀌어도 이 generation은 이 값을 쓴다.
+      const socket = this, previous = sendQueues.get(chatId) || Promise.resolve(), plan = takeTurnPlan(chatId);
       const task = previous.catch(() => {}).then(async () => {
         const started = Date.now(), diag = { generationId: '', event: parsed.event, at: started, hook: hookInfo.position, patched: false, verified: false, cleanup: 'not-needed', skipReason: '', recoveryReason: '' };
         const controller = new PageAbortController(), timer = setTimeout(() => controller.abort(), PREPARE_TIMEOUT_MS); let record = null;
-        try { record = await injectAutoOoc(parsed, controller.signal, socket, diag); }
+        if (plan.overrides.size) diag.manualOverrides = Object.fromEntries(plan.overrides);
+        try { record = await injectAutoOoc(parsed, controller.signal, socket, diag, plan); }
         catch (error) { diag.skipReason = diag.skipReason || (error?.code === 'AUTO_OOC_ABORT' ? 'timeout' : 'error'); diag.error = String(error?.message || error); console.warn('[Crack OOC 보관함] 자동주입 실패 · 정상 채팅을 계속합니다.', error); }
         finally { clearTimeout(timer); }
         diag.prepareMs = Date.now() - started;
@@ -1427,6 +1686,7 @@
       check, transport, selectAutoOoc: (data, request) => selectAutoOoc(check(data), request), stableCarrierFrame, selectAutoCarrier, detectWish, removeAutoRegions, countAutoRegions, autoRegion, autoRegionOverhead,
       conditionSourceText, cleanupAutoRecord, cleanupChatResidues, injectAutoOoc, markerPattern, fitBundleForCarrier, loadResidues, diagnostics: autoDiagnostics, hookInfo, live,
       composeCarrier, previewTurn: (data, api) => previewTurn(check(data), api), PREVIEW_GENERATION_ID, fresh, normalizeAuto, normalizeSettings, readLibrary, generationFrame, GENERATION_MODES, GENERATION_EVENTS,
+      turnOoc, refreshTurn: api => readLibrary().then(data => refreshTurn(data, api)), scheduleTurn, setTurnOverride, turnChecklist, peekTurnPlan, takeTurnPlan, toastLog, situationCacheKey, TURN_DEBOUNCE_MS, watchTurnPage,
       modelOptions, legacyModelKey, refreshModelCatalog, currentModelContext, visibleAssistantText,
       parseFirebaseAppConfig, normalizeSituationSettings, saveSituationSettings, judgeSituations, parseMatchedIds, pendingSituations: (data, request) => pendingSituations(check(data), request),
       testSituationApi, situationPrompt, diagnosticsText, SITUATION_MODELS, SITUATION_CONTEXT_MESSAGES, SITUATION_TIMEOUT_MS,
@@ -1572,8 +1832,8 @@
       if (!row.modelKey && row.value) { const found = legacyModelKey(row.value); if (found) Object.assign(row, { modelKey: found, modelName: modelOptions().find(option => option.key === found)?.name || '', value: '' }); }
       const select = labelled(node('select'), label), options = modelOptions(), chosen = row.modelKey || (row.value ? LEGACY_MODEL_OPTION : '');
       select.append(new Option(options.length ? '모델 선택' : modelCatalogLoading ? '모델 목록을 불러오는 중…' : '모델 목록을 불러오지 못했습니다', ''));
-      // 지금 Crack에서 고를 수 있는 유료 모델만 한 목록으로 보여 준다. 이미 저장돼 있던 값이 종료·무료 모델이면 그 항목 하나만 표시용으로 덧붙인다.
-      for (const option of options) if (option.selectable || option.key === chosen) select.append(new Option(option.selectable ? option.label : `${option.label} (${option.retired ? '종료된 모델' : '선택 대상 아님'})`, option.key));
+      // 지금 Crack에서 고를 수 있는 유료 모델만 이름 하나씩 보여 준다. 이미 저장돼 있던 값이 종료·무료 모델이거나 같은 이름의 다른 key면 그 항목 하나만 표시용으로 덧붙인다.
+      for (const option of options) if (option.selectable || option.key === chosen) select.append(new Option(option.selectable || option.alias ? option.label : `${option.label} (${option.retired ? '종료된 모델' : '선택 대상 아님'})`, option.key));
       if (chosen === LEGACY_MODEL_OPTION) select.append(new Option(`기존 입력값 유지: ${row.value}`, LEGACY_MODEL_OPTION));
       else if (chosen && !options.some(option => option.key === chosen)) select.append(new Option(`${row.modelName || chosen} (현재 목록에 없음)`, chosen));
       select.value = chosen;
@@ -1671,14 +1931,15 @@
     const uses = type => allEntries(data).some(item => item.autoInjection.enabled && item.autoInjection.conditions.some(condition => condition.type === type));
     const rawBox = (label, text, rows) => { const box = node('textarea', 'oa-raw-text'); box.readOnly = true; box.rows = rows; box.spellcheck = false; box.value = text; box.setAttribute('aria-label', label); return box; };
     root.replaceChildren();
-    if (shown.carrier) final.selected.forEach((item, order) => root.append(node('div', '', `${order + 1}. ${item.name}`)));
+    if (shown.carrier) final.selected.forEach((item, order) => root.append(node('div', '', `${order + 1}. ${item.name}${item.manual ? ' · 직접 선택' : ''}`)));
     else root.append(node('span', 'oa-muted', `이번 턴에는 자동 OOC가 붙지 않습니다. ${PREVIEW_REASONS[shown.reason] || shown.reason}${shown.error ? ` (${shown.error})` : ''}`));
     if (shown.carrier) line(`보관함 순서대로 적용 · AUTO 구간 ${count(final.chars)}자 / 최대 ${count(shown.maxChars)}자`);
     else if (final?.selected.length) line(`조건에 맞은 OOC: ${final.selected.map(item => item.name).join(', ')}`);
     const overBudget = (final?.omitted || []).filter(item => item.reason === 'over-budget');
     if (overBudget.length) line(`한도 때문에 제외: ${overBudget.map(item => item.name).join(', ')}`);
     if (turn) {
-      const judged = turn.judged, model = turn.model;
+      const judged = turn.judged, model = turn.model, removed = [...shown.overrides.values()].filter(value => value === false).length;
+      if (removed) line(`이번 턴 OOC에서 직접 뺀 ${removed}개는 넣지 않습니다.`);
       line(`생성 방식: ${PREVIEW_MODES[shown.generationMode] || shown.generationMode}${shown.targetUserId ? ` · ${shown.userTextSource === 'server-trailing-user' ? '대상 USER' : '답 없는 USER 뒤에 보냄'}: 메시지 ${shown.targetUserId}` : ''}`);
       if (judged) line(judged.info.error ? `상황 감지 실패(${judged.message || judged.info.error}) → 상황 조건이 든 OOC는 빠집니다.` : `상황 감지: 조건 ${judged.info.conditions}개 중 ${judged.info.matched}개 해당 (${(judged.info.ms / 1000).toFixed(1)}초)`);
       else if (uses('situation')) line('상황 감지: 다른 조건에서 먼저 걸러져 이번에는 API에 묻지 않습니다.');
@@ -1967,7 +2228,8 @@
     .oa-dialog{--oa-bg:hsl(var(--card,0 0% 9%));--oa-fg:hsl(var(--foreground,0 0% 98%));--oa-muted:hsl(var(--muted-foreground,0 0% 58%));--oa-line:hsl(var(--border,0 0% 22%));--oa-accent:#a5a0f5;color:var(--oa-fg);background:var(--oa-bg);border:1px solid var(--oa-line);border-radius:16px;padding:0;width:min(520px,calc(100vw - 32px));max-height:86vh;box-shadow:0 24px 80px #0007;font:14px/1.5 system-ui}
     .oa-dialog [hidden]{display:none!important}.oa-dialog::backdrop{background:#0007}.oa-dialog.oa-large{width:min(680px,calc(100vw - 32px))}.oa-dialog.oa-guide{width:min(620px,calc(100vw - 32px))}.oa-header{display:flex;align-items:center;gap:8px;height:64px;padding:0 20px;border-bottom:1px solid var(--oa-line)}.oa-header strong{font-size:16px;font-weight:650}.oa-header>.oa-icon{margin-left:auto}.oa-actions{display:flex;gap:4px;margin-left:auto}.oa-dot{width:7px;height:7px;background:#f06b73;border-radius:50%}.oa-body{padding:20px;overflow:auto;max-height:calc(86vh - 142px)}.oa-large .oa-body{min-height:260px;max-height:calc(86vh - 66px)}.oa-footer{display:flex;justify-content:flex-end;gap:8px;padding:12px 20px;border-top:1px solid var(--oa-line)}
     .oa-dialog button{font:inherit;cursor:pointer}.oa-icon{display:inline-flex;align-items:center;justify-content:center;width:32px;height:32px;padding:6px;border:0;border-radius:6px;background:transparent;color:var(--oa-muted,currentColor);flex-shrink:0}.oa-icon svg, .oa-symbol svg,.oa-search svg,.oa-toggle svg,.oa-list-folder svg{width:20px;height:20px;display:block;flex-shrink:0}.oa-icon:hover,.oa-toggle:hover{background:#8882;color:var(--oa-fg,inherit)}.oa-dialog button:disabled{opacity:.35;cursor:default}.oa-dialog button:focus-visible,.oa-dialog summary:focus-visible{outline:2px solid var(--oa-accent);outline-offset:2px}.oa-button{border:1px solid var(--oa-line);background:transparent;color:inherit;border-radius:8px;padding:7px 14px}.oa-primary{background:var(--oa-accent);color:#171724;border-color:transparent}.oa-toolbar{display:flex;align-items:center;gap:6px;margin-bottom:14px}.oa-search{display:flex;align-items:center;gap:8px;flex:1;border:1px solid var(--oa-line);border-radius:8px;padding:0 10px;color:var(--oa-muted)}
-    .oa-dialog input,.oa-dialog textarea,.oa-dialog select{color:inherit;background:transparent;border:1px solid var(--oa-line);border-radius:8px;padding:9px 10px;font:inherit;width:100%;box-sizing:border-box;min-width:0}.oa-search input{border:0;outline:none;padding:9px 0}.oa-field{display:flex;flex-direction:column;gap:7px;margin-bottom:16px}.oa-field>span{font-size:13px;color:var(--oa-muted)}.oa-dialog textarea{resize:vertical;white-space:pre-wrap}.oa-dialog select option{color:#eee;background:#222}.oa-toggle-field{display:grid;grid-template-columns:auto 1fr;gap:4px 9px;align-items:center;margin:0 0 16px}.oa-toggle-field input{width:18px;height:18px}.oa-toggle-field small{grid-column:2;color:var(--oa-muted);line-height:1.45}.oa-hint{margin:-8px 0 14px;color:var(--oa-muted);font-size:12px;line-height:1.5}.oa-auto-editor,.oa-settings-section{border-top:1px solid var(--oa-line);padding-top:16px;margin-top:4px}.oa-settings-section{border:1px solid var(--oa-line);border-radius:10px;padding:14px;margin-bottom:22px}.oa-preview{margin-top:12px;padding:10px;border-radius:8px;background:#8881}.oa-preview strong{display:block;margin-bottom:6px}.oa-preview-list{white-space:pre-wrap}.oa-preview-list small{display:block;color:var(--oa-muted);margin-top:6px}.oa-muted{color:var(--oa-muted)}.oa-conditions-title{margin:4px 0 10px;font-size:13px;color:var(--oa-muted);font-weight:600}.oa-condition{border:1px solid var(--oa-line);border-radius:10px;padding:10px;margin-bottom:10px}.oa-condition-head{display:flex;align-items:center;gap:8px}.oa-condition-head select{flex:1}.oa-condition-number{color:var(--oa-muted);min-width:18px}.oa-condition-detail{display:flex;flex-direction:column;gap:8px;margin-top:8px}.oa-condition-detail small{color:var(--oa-muted);font-size:12px;line-height:1.5}.oa-condition-detail small.oa-condition-warning{color:#ed969e}.oa-conditions-note{margin:12px 0 0}.oa-api-fields{margin-top:4px}.oa-settings-section .oa-button-row{margin-top:4px;flex-wrap:wrap}.oa-raw{margin-top:10px}.oa-raw summary{cursor:pointer;font-size:13px}.oa-raw-stats{margin:8px 0;color:var(--oa-muted);font-size:12px;line-height:1.5}.oa-dialog textarea.oa-raw-text{font:12px/1.5 ui-monospace,SFMono-Regular,Consolas,monospace;white-space:pre-wrap;overflow-wrap:anywhere;max-height:320px;overflow:auto}.oa-raw .oa-button-row{align-items:center;margin-top:8px}.oa-diagnostics{margin-top:12px}.oa-diagnostics summary{cursor:pointer;color:var(--oa-muted);font-size:12px}.oa-diagnostics pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#8881;border-radius:6px;padding:10px;margin:8px 0 0;font-size:11px;max-height:240px;overflow:auto}
+    .oa-dialog input,.oa-dialog textarea,.oa-dialog select{color:inherit;background:transparent;border:1px solid var(--oa-line);border-radius:8px;padding:9px 10px;font:inherit;width:100%;box-sizing:border-box;min-width:0}.oa-search input{border:0;outline:none;padding:9px 0}.oa-field{display:flex;flex-direction:column;gap:7px;margin-bottom:16px}.oa-field>span{font-size:13px;color:var(--oa-muted)}.oa-dialog textarea{resize:vertical;white-space:pre-wrap}.oa-dialog select option{color:#eee;background:#222}.oa-toggle-field{display:grid;grid-template-columns:auto 1fr;gap:4px 9px;align-items:center;margin:0 0 16px}.oa-toggle-field input{width:18px;height:18px}.oa-toggle-field small{grid-column:2;color:var(--oa-muted);line-height:1.45}.oa-hint{margin:-8px 0 14px;color:var(--oa-muted);font-size:12px;line-height:1.5}.oa-auto-editor,.oa-settings-section{border-top:1px solid var(--oa-line);padding-top:16px;margin-top:4px}.oa-settings-section{border:1px solid var(--oa-line);border-radius:10px;padding:14px;margin-bottom:22px}.oa-preview{margin-top:12px;padding:10px;border-radius:8px;background:#8881}.oa-preview strong{display:block;margin-bottom:6px}.oa-preview-list{white-space:pre-wrap}.oa-preview-list small{display:block;color:var(--oa-muted);margin-top:6px}.oa-muted{color:var(--oa-muted)}.oa-conditions-title{margin:4px 0 10px;font-size:13px;color:var(--oa-muted);font-weight:600}.oa-condition{border:1px solid var(--oa-line);border-radius:10px;padding:10px;margin-bottom:10px}.oa-condition-head{display:flex;align-items:center;gap:8px}.oa-condition-head select{flex:1}.oa-condition-number{color:var(--oa-muted);min-width:18px}.oa-condition-detail{display:flex;flex-direction:column;gap:8px;margin-top:8px}.oa-condition-detail small{color:var(--oa-muted);font-size:12px;line-height:1.5}.oa-condition-detail small.oa-condition-warning{color:#ed969e}.oa-conditions-note{margin:12px 0 0}.oa-api-fields{margin-top:4px}.oa-settings-section .oa-button-row{margin-top:4px;flex-wrap:wrap}.oa-raw{margin-top:10px}.oa-raw summary{cursor:pointer;font-size:13px}.oa-raw-stats{margin:8px 0;color:var(--oa-muted);font-size:12px;line-height:1.5}.oa-dialog textarea.oa-raw-text{font:12px/1.5 ui-monospace,SFMono-Regular,Consolas,monospace;white-space:pre-wrap;overflow-wrap:anywhere;max-height:320px;overflow:auto}.oa-raw .oa-button-row{align-items:center;margin-top:8px}
+    .oa-turn,.oa-toast{--oa-bg:hsl(var(--card,0 0% 9%));--oa-fg:hsl(var(--foreground,0 0% 98%));--oa-muted:hsl(var(--muted-foreground,0 0% 58%));--oa-line:hsl(var(--border,0 0% 22%));--oa-accent:#a5a0f5;position:fixed;z-index:20;font:12px/1.4 system-ui;color:var(--oa-fg)}.oa-turn[hidden],.oa-turn [hidden]{display:none!important}.oa-turn{display:flex;flex-direction:column;align-items:flex-end;gap:6px;max-width:calc(100vw - 16px)}.oa-turn-chip{border:1px solid var(--oa-line);background:var(--oa-bg);color:var(--oa-muted);border-radius:999px;padding:3px 10px;font:inherit;cursor:pointer;white-space:nowrap;max-width:100%;overflow:hidden;text-overflow:ellipsis}.oa-turn-chip[aria-expanded="true"]{color:var(--oa-fg);border-color:var(--oa-accent)}.oa-turn-chip:focus-visible{outline:2px solid var(--oa-accent);outline-offset:2px}.oa-turn-list{width:min(300px,calc(100vw - 16px));max-height:min(45vh,340px);overflow:auto;background:var(--oa-bg);border:1px solid var(--oa-line);border-radius:12px;padding:8px;box-shadow:0 12px 40px #0007;box-sizing:border-box}.oa-turn-head{font-weight:600;font-size:13px;margin:2px 4px 6px}.oa-turn-row{display:grid;grid-template-columns:auto minmax(0,1fr) auto;align-items:center;gap:8px;padding:6px 4px;border-radius:6px;cursor:pointer}.oa-turn-row:hover{background:#8882}.oa-turn-row input{width:16px;height:16px;margin:0;accent-color:var(--oa-accent)}.oa-turn-name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:13px}.oa-turn-row small{color:var(--oa-muted);white-space:nowrap}.oa-turn-manual small{color:var(--oa-accent)}.oa-turn-foot{display:flex;align-items:center;justify-content:space-between;gap:8px;margin:8px 4px 2px;color:var(--oa-muted)}.oa-turn-foot button{border:1px solid var(--oa-line);background:transparent;color:inherit;border-radius:6px;padding:2px 8px;font:inherit;cursor:pointer;white-space:nowrap}.oa-toast{background:var(--oa-bg);border:1px solid var(--oa-line);border-radius:10px;padding:8px 12px;white-space:pre-line;box-shadow:0 8px 24px #0006;max-width:min(280px,calc(100vw - 16px));pointer-events:none}.oa-diagnostics{margin-top:12px}.oa-diagnostics summary{cursor:pointer;color:var(--oa-muted);font-size:12px}.oa-diagnostics pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#8881;border-radius:6px;padding:10px;margin:8px 0 0;font-size:11px;max-height:240px;overflow:auto}
     .oa-group{margin:8px 0;border:1px solid var(--oa-line);border-radius:10px;overflow:visible}.oa-group>.oa-row{background:#8881;border-radius:9px}.oa-row{position:relative;display:flex;align-items:center;gap:9px;min-height:44px;padding:4px 8px;box-sizing:border-box}.oa-name{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.oa-group>.oa-row>.oa-name{font-weight:600;cursor:pointer}.oa-symbol{color:var(--oa-muted);flex-shrink:0}.oa-group>.oa-row>.oa-symbol{color:#c4b391}.oa-count{color:var(--oa-muted);font-size:12px}.oa-auto-badge{font-size:11px;color:#b9b5ff;border:1px solid #a5a0f555;border-radius:999px;padding:1px 6px;white-space:nowrap}.oa-review-badge{color:#ed969e;border-color:#eb6b7466}.oa-row-actions{display:flex;gap:2px}.oa-row-actions .oa-icon{width:28px;height:28px;padding:5px}.oa-row-actions .oa-icon[data-sort]{cursor:grab;touch-action:none}.oa-toggle{width:20px;height:28px;border:0;padding:0;background:transparent;color:var(--oa-muted);flex-shrink:0}.oa-toggle svg{width:16px;height:16px;transition:transform .15s}.oa-open .oa-toggle svg{transform:rotate(90deg)}.oa-children{margin:0 12px 10px 30px;padding-left:8px;border-left:2px solid var(--oa-line)}.oa-children .oa-row+.oa-row{border-top:1px solid #8882}.oa-extras{margin-top:14px}.oa-extras>.oa-row{border-bottom:1px solid #8882}.oa-empty{height:28px}.oa-before::before,.oa-after::after{content:'';position:absolute;left:0;right:0;height:3px;background:var(--oa-accent);border-radius:3px;z-index:2;pointer-events:none}.oa-before::before{top:0}.oa-after::after{bottom:0}.oa-children,.oa-extras{position:relative}.oa-dragging{opacity:.3}.oa-ghost{position:fixed;pointer-events:none;z-index:3;background:var(--oa-bg);border:1px solid var(--oa-line);border-radius:8px;box-shadow:0 8px 24px #0006;opacity:.95}
     .oa-message{white-space:pre-line;margin:0 0 14px;line-height:1.7}.oa-warning{color:#ed969e;background:#eb6b7410;border:1px solid #eb6b7440;border-radius:8px;padding:12px}.oa-source-options{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin:14px 0}.oa-source{display:flex;flex-direction:column;align-items:flex-start;gap:8px;padding:14px}.oa-source span{font-size:12px;color:var(--oa-muted)}.oa-source.oa-selected{border-color:var(--oa-accent);background:#a5a0f512}.oa-button-row{display:flex;gap:8px}.oa-body h3{margin:0 0 14px;font-size:14px}.oa-db-top{display:flex;align-items:center;gap:8px;margin-bottom:16px}.oa-segment{display:flex;padding:3px;border-radius:9px;background:#8882;flex:1}.oa-segment label{flex:1;text-align:center;cursor:pointer}.oa-segment input{position:absolute;opacity:0;width:1px;height:1px}.oa-segment span{display:block;border-radius:6px;padding:7px 12px;color:var(--oa-muted)}.oa-segment input:checked+span{color:var(--oa-fg);background:var(--oa-bg);box-shadow:0 1px 4px #0003}.oa-segment input:focus-visible+span{outline:2px solid var(--oa-accent)}.oa-credentials{display:grid;grid-template-columns:minmax(0,1.2fr) minmax(0,1fr) auto;gap:8px;align-items:center}.oa-credentials .oa-button{padding:9px 12px}.oa-auth-state{font-size:12px;color:var(--oa-muted);min-height:18px;margin:10px 0 0}.oa-guide-section{border-bottom:1px solid var(--oa-line);padding:12px 0}.oa-guide-section:first-child{padding-top:0}.oa-guide-section summary{cursor:pointer;font-weight:600}.oa-guide-section ol{padding-left:23px}.oa-guide-section li{margin:8px 0;line-height:1.7}.oa-guide-section pre{white-space:pre-wrap;background:#8881;border-radius:6px;padding:10px;font-size:12px}.oa-guide-section small{color:var(--oa-muted);overflow-wrap:anywhere}
     .oa-native-hidden{display:none!important}.oa-tabs{overflow-x:auto!important;overflow-y:hidden!important;flex-wrap:nowrap!important}.oa-tab{background:transparent;border:0;border-bottom:2px solid transparent;padding:0 8px 8px;margin-bottom:-1px;flex-shrink:0;font-size:14px;font-weight:var(--oa-tab-weight,400);color:var(--oa-tab-color,inherit);white-space:nowrap;border-radius:0}.oa-tab.oa-tab-active{border-bottom-color:currentColor;font-weight:var(--oa-tab-active-weight,600);color:var(--oa-tab-active-color,inherit)}.oa-panel-config{width:28px;height:28px;margin-bottom:6px}.oa-panel-body{min-height:0;flex:1;overflow:auto;padding:8px 16px;font-size:14px}.oa-panel-body[hidden]{display:none}.oa-use{display:block;border:0;background:transparent;color:inherit;padding:8px;width:100%;text-align:left;border-radius:6px;font-size:14px}.oa-use:hover{background:#8882}.oa-list-folder summary{display:flex;align-items:center;gap:8px;padding:8px 0;cursor:pointer;font-weight:600;list-style:none}.oa-list-folder summary::-webkit-details-marker{display:none}.oa-list-folder summary svg:first-child{width:14px;height:14px}.oa-list-folder[open] summary svg:first-child{transform:rotate(90deg)}.oa-list-folder>.oa-use{margin-left:20px;width:calc(100% - 20px);padding-left:12px;border-left:2px solid #8884;border-radius:0}
@@ -1975,7 +2237,7 @@
   `; document.head.append(styles);
   let queued = false;
   const observer = new MutationObserver(() => { if (queued) return; queued = true; requestAnimationFrame(() => { queued = false; discover(); }); });
-  observer.observe(document.body, { childList: true, subtree: true }); discover(); bookmark();
+  observer.observe(document.body, { childList: true, subtree: true }); discover(); bookmark(); startTurnUi();
   }
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', startUi, { once: true });
   else startUi();
