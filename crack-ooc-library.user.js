@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Crack OOC 보관함
 // @namespace    crack.ooc.library
-// @version      2.0.3.1
+// @version      2.0.4.0
 // @description  OOC를 보관하고 안전한 assistant carrier에 독립적으로 자동 컨텍스트를 주입 (version 관리방식: 데이터구조버전.크랙UI변경.기능추가및수정.버그수정)
 // @match        https://crack.wrtn.ai/*
 // @noframes
@@ -26,6 +26,10 @@
  *   우선순위는 보관함 표시 순서다. 기존 priority 값으로 순서를 바꾸지 않는다. 내용이 비어 있고 주입용 본문만 있던 항목은
  *   그 글을 content로 옮긴다. 모델 조건은 autoInjection.modelKey(crackerModel)/modelName으로 저장하며, 예전에 직접 입력한
  *   모델 문자열(conditionValue)은 그대로 두고 계속 비교에 쓴다. 2.0.2.x가 이 자료를 저장하면 modelKey/modelName이 빠진다.
+ *
+ * - 2.0.4.0: 조건 유형 'userLength'(USER 입력 글자수)를 없애고 'assistantLength'(AI 응답 글자수)를 넣었다. 뜻이 다르므로 예전
+ *   userLength 항목은 조건값을 남긴 채 자동주입을 끄고 autoInjection.legacyCondition = 'userLength'로 "다시 확인 필요"를 표시한다
+ *   (편집창에서 적용하면 표시가 사라진다). 2.0.3.x 이하는 assistantLength를 몰라 '항상'으로 읽으므로 같은 자료를 쓰는 기기는 함께 올려야 한다.
  *
  * 자동 OOC (2.0.2.0)
  * - USER 메시지와 WebSocket payload는 읽기만 한다. 자동 OOC는 과거 assistant 메시지(carrier) 끝에
@@ -56,8 +60,8 @@
   const SAMPLE_GENERATION_ID = '0'.repeat(36);
   const WRMC_MODES = ['auto', 'always', 'never'];
   const RESIDUE_KEY = 'crack-ooc-library.auto-residues.v1';
-  const CONDITION_TYPES = new Set(['always', 'model', 'userLength', 'keyword']);
-  const MODEL_CACHE_KEY = 'crack-ooc-library.chat-models.v1';
+  const CONDITION_TYPES = new Set(['always', 'model', 'assistantLength', 'keyword']);
+  const MODEL_CACHE_KEY = 'crack-ooc-library.chat-models.v2';
   const MODEL_CACHE_MAX_AGE_MS = 6 * 60 * 60 * 1000;
   // Crack chat-models API가 받는 serviceType 값과 dropdown 묶음 이름.
   const MODEL_SERVICES = [['story', '스토리'], ['character', '캐릭터'], ['partyChat', '파티챗']];
@@ -93,18 +97,25 @@
   }
   function normalizeAuto(value = {}) {
     const src = value && typeof value === 'object' && !Array.isArray(value) ? value : {};
-    const conditionType = CONDITION_TYPES.has(src.conditionType) ? src.conditionType : AUTO_DEFAULTS.conditionType;
+    // 예전 'userLength'(USER 입력 글자수)는 뜻이 다른 조건이다. 켜 둔 채 'assistantLength'로 바꾸면 엉뚱한 때 주입되므로
+    // 조건값만 넘기고 자동주입은 끈 뒤 legacyCondition으로 표시해 사용자가 다시 확인하게 한다.
+    // 이 버전이 모르는 조건 유형도 켜진 채 '항상'이 되지 않게 끈다.
+    const legacyUserLength = src.conditionType === 'userLength', known = CONDITION_TYPES.has(src.conditionType);
+    const conditionType = legacyUserLength ? 'assistantLength' : known ? src.conditionType : AUTO_DEFAULTS.conditionType;
+    const enabled = src.enabled === true && !legacyUserLength && (known || src.conditionType == null);
+    const legacyCondition = legacyUserLength || src.legacyCondition === 'userLength' && conditionType === 'assistantLength' && !enabled ? 'userLength' : '';
     // 2.0.3.0: priority와 injectionBody는 읽을 때 무시하고 저장할 때 빠진다. 우선순위는 보관함 표시 순서다.
     // modelKey는 Crack chat-models의 crackerModel 값, modelName은 그때의 표시명이다.
     // modelKey가 없는 모델 조건의 conditionValue는 2.0.2.x에서 직접 입력한 문자열이며 그대로 보존한다.
     const modelKey = conditionType === 'model' && typeof src.modelKey === 'string' ? src.modelKey.trim().slice(0, 200) : '';
     return {
-      enabled: src.enabled === true,
+      enabled,
       conditionType,
       conditionValue: String(src.conditionValue || '').slice(0, 1000),
       keywordScope: ['user', 'recent', 'both'].includes(src.keywordScope) ? src.keywordScope : 'user',
       modelKey,
       modelName: modelKey && typeof src.modelName === 'string' ? src.modelName.trim().slice(0, 200) : '',
+      ...(legacyCondition ? { legacyCondition } : {}),
     };
   }
   function normalizeSettings(value = {}) {
@@ -343,7 +354,8 @@
   const modelText = value => String(value ?? '').normalize('NFKC').trim().toLocaleLowerCase();
 
   // Crack 모델 목록. GET crack-gen/v3/chat-models?serviceType=… 의 실제 응답만 쓴다 (이름을 스크립트에 적어 두지 않는다).
-  // 한 행: { id: _id, name: 표시명, key: crackerModel, service, retired }. 같은 key가 가격·버전별로 여러 _id를 가진다.
+  // 한 행: { id: _id, name: 표시명, key: crackerModel, service, retired, free }. 같은 key가 가격·버전별로 여러 _id를 가진다.
+  // free는 크래커 소모가 0인 행이다 (캐릭터 채팅의 Basic, 예전 일반챗). 현재 방의 모델을 알아보는 데는 쓰지만 dropdown에는 내놓지 않는다.
   let modelCatalog = [], modelCatalogAt = 0, modelCatalogLoading = null, modelCatalogFetchedAt = 0, modelCatalogForcedAt = 0;
   const catalogRow = row => row && typeof row.id === 'string' && typeof row.name === 'string' && typeof row.key === 'string' && row.id && row.name && row.key;
   try {
@@ -351,7 +363,7 @@
     if (Array.isArray(cached?.rows)) { modelCatalog = cached.rows.filter(catalogRow); modelCatalogAt = Number(cached.at) || 0; }
   } catch { /* 캐시가 없으면 필요할 때 불러온다. */ }
   function catalogRows(models, service) {
-    return (Array.isArray(models) ? models : []).map(model => ({ id: String(model?._id || ''), name: String(model?.name || '').trim(), key: String(model?.crackerModel || '').trim(), service, retired: !!model?.deletedAt || model?.isBlock === true })).filter(catalogRow);
+    return (Array.isArray(models) ? models : []).map(model => ({ id: String(model?._id || ''), name: String(model?.name || '').trim(), key: String(model?.crackerModel || '').trim(), service, retired: !!model?.deletedAt || model?.isBlock === true, free: Number(model?.crackerQuantity) === 0 })).filter(catalogRow);
   }
   function refreshModelCatalog(signal, force = false) {
     if (!force && modelCatalog.length && Date.now() - modelCatalogAt < MODEL_CACHE_MAX_AGE_MS) return Promise.resolve(modelCatalog);
@@ -376,19 +388,16 @@
     modelCatalogForcedAt = now;
     await refreshModelCatalog(signal, true).catch(() => []);
   }
-  // dropdown용: key가 같은 행을 하나로 합친다 (다른 묶음에 같은 모델이 또 나와도 처음 나온 묶음에만 둔다).
-  // 판매 종료된 행만 남은 모델은 retired다.
-  function modelGroups() {
+  // dropdown용 목록 하나. key가 같은 행은 하나로 합치고(다른 서비스에 같은 모델이 또 나와도 한 번만), 스토리 밖의 모델은
+  // 어디 것인지 이름 뒤에 붙인다. selectable은 지금 Crack에서 고를 수 있는 유료 모델이다: 판매 종료(retired)와 무료(free) 행만 남은 모델은 빠진다.
+  function modelOptions() {
     const byKey = new Map();
-    return MODEL_SERVICES.map(([service, label]) => {
-      const options = [];
-      for (const row of modelCatalog.filter(item => item.service === service)) {
-        const known = byKey.get(row.key);
-        if (!known) { const option = { key: row.key, name: row.name, retired: row.retired }; byKey.set(row.key, option); options.push(option); }
-        else if (known.retired && !row.retired) { known.name = row.name; known.retired = false; }
-      }
-      return { service, label, options };
-    }).filter(group => group.options.length);
+    for (const [service, serviceLabel] of MODEL_SERVICES) for (const row of modelCatalog.filter(item => item.service === service)) {
+      const live = !row.retired && !row.free, known = byKey.get(row.key);
+      if (!known) byKey.set(row.key, { key: row.key, name: row.name, label: service === 'story' ? row.name : `${row.name} (${serviceLabel})`, retired: row.retired, free: !!row.free, selectable: live });
+      else if (!known.selectable && live) Object.assign(known, { name: row.name, retired: false, free: false, selectable: true });
+    }
+    return [...byKey.values()];
   }
   // 2.0.2.x에서 직접 입력한 모델 문자열 하나가 현재 목록의 모델과 정확히 맞으면 그 key를 돌려준다.
   function legacyModelKey(value) {
@@ -425,9 +434,10 @@
       const actual = modelValues(request.model), wanted = rule.modelKey ? ruleModelValues(rule) : splitValues(value).map(modelText);
       return wanted.length > 0 && wanted.some(item => actual.includes(item));
     }
-    if (rule.conditionType === 'userLength') {
-      const range = parseLengthCondition(value); if (!range) return false;
-      const length = String(request.userText || '').length; return length >= range.min && length <= range.max;
+    if (rule.conditionType === 'assistantLength') {
+      // 직전(리롤이면 리롤 대상) AI 응답의 표시 본문 길이만 본다. USER 입력 길이는 쓰지 않으며, 응답을 찾지 못하면 이 조건만 불일치다.
+      const range = parseLengthCondition(value); if (!range || typeof request.assistantText !== 'string') return false;
+      const length = request.assistantText.length; return length >= range.min && length <= range.max;
     }
     if (rule.conditionType === 'keyword') {
       const words = splitValues(value).map(item => item.toLocaleLowerCase()); if (!words.length) return false;
@@ -634,6 +644,20 @@
     const cleaned = removeAutoRegions(source).replace(LORE_TAG_PATTERN, '\n').replace(LORE_TAG_ESCAPED_PATTERN, '\n').replace(WISH_BLOCK_PATTERN, '\n');
     return cleaned === source ? source : cleaned.trim();
   }
+  // AI가 실제로 출력한 본문. 이 스크립트의 AUTO 구간, WRMC의 숨김 블록(WRMC가 스스로 걷어내는 형태들), 그 밖의 HTML 주석을 뺀다.
+  const HIDDEN_ASSISTANT_PATTERNS = [
+    WISH_BLOCK_PATTERN,
+    /(?:\\|\?)?(?:<!--|&lt;!--)WISH_SESSION_SETUP_START\b[\s\S]*?WISH_SESSION_SETUP_END(?:-->|--&gt;)/gi,
+    /<rp_context_manager\b[\s\S]*?<\/rp_context_manager>/gi,
+    /(?:\\|\?)?<!--RP_CTX\b[\s\S]*?RP_CTX_END-->/gi,
+    /^\s*\[\/\/\]: # \(RP_COG_V1\|[^\n]*\)\s*$/gmi,
+    /<!--[\s\S]*?-->/g,
+  ];
+  function visibleAssistantText(text) {
+    let out = removeAutoRegions(String(text ?? ''));
+    for (const pattern of HIDDEN_ASSISTANT_PATTERNS) out = out.replace(pattern, '');
+    return normalizeBreaks(out).trim();
+  }
   function visibleConversationText(messages) {
     return [...(messages || [])].reverse().map(message => removeAutoRegions(messageTextOf(message)).replace(LORE_TAG_PATTERN, '\n').replace(LORE_TAG_ESCAPED_PATTERN, '\n').replace(/<!--[^]*?-->/g, '')).join('\n\n').slice(-12000);
   }
@@ -648,17 +672,15 @@
     return { crackerModel: text(room.crackerModel), chatModelId: text(room.chatModelId), model: text(room.model) };
   }
   // 한 출처만 쓴다. 여러 출처를 섞으면 모델을 바꾼 직후 예전 모델 조건까지 맞아 버린다.
-  // 전송 payload → 방 정보 → 화면의 모델 버튼 → 직전 AI 답변 → 페이지 로드 때의 metadata 순서이며,
+  // 방 정보 → 화면의 모델 버튼 → 직전 AI 답변 → 페이지 로드 때의 metadata 순서이며 (Crack의 send/reroll payload에는 모델 값이 없다),
   // 아무 곳에서도 못 찾으면 빈 값이 되어 모델 조건 OOC만 빠진다.
   function currentModelContext(payload, messages = [], room = null) {
     const fields = source => {
       const pick = (...keys) => { for (const key of keys) if (typeof source?.[key] === 'string' && source[key].trim()) return source[key].trim(); return ''; };
       return { crackerModel: pick('crackerModel', 'cracker_model'), chatModelId: pick('chatModelId', 'chat_model_id'), model: pick('model', 'modelId', 'model_id', 'engine'), label: pick('modelName', 'modelLabel', 'crackerModelName') };
     };
-    const merged = (...sources) => sources.map(fields).reduce((out, row) => { for (const key of Object.keys(row)) if (!out[key]) out[key] = row[key]; return out; }, fields(null));
     const known = context => Object.values(context).some(Boolean);
     const tiers = [
-      ['payload', () => merged(payload, payload?.data, payload?.options, payload?.data?.options)],
       ['room', () => fields(room)],
       ['model-button', () => ({ ...fields(null), label: semanticModelLabel() })],
       ['last-assistant', () => fields((messages || []).find(message => messageRoleOf(message) === 'assistant'))],
@@ -863,10 +885,15 @@
     const userTextSource = parsed.event !== 'send' ? 'server-latest-user' : typeof payloadText === 'string' ? 'payload' : 'unknown';
     const userText = conditionSourceText(userTextSource === 'payload' ? payloadText : userTextSource === 'unknown' ? '' : messageTextOf(frame.latestUser));
     diag.userTextSource = userTextSource;
+    // 글자수 조건의 기준. send는 방금 끝난 직전 AI 응답, reroll은 다시 만들 대상 응답이다. Crack의 reroll payload는
+    // { chatId, freeChatPassCampaignId, instruction }뿐이라 대상 id가 없고 항상 최신 AI 응답을 다시 만든다. 그래서 둘 다
+    // 목록의 최신 assistant를 읽되(주입 대상 carrier나 더 오래된 답변이 아니다), 교체되기 전의 본문을 지금 읽어 둔다.
+    const assistantText = frame.latest ? visibleAssistantText(messageTextOf(frame.latest)) : null;
+    Object.assign(diag, { assistantChars: assistantText === null ? null : assistantText.length, assistantSource: !frame.latest ? 'none' : parsed.event === 'reroll' ? 'reroll-target' : 'latest', assistantMessageId: messageIdOf(frame.latest) });
     await catalogReady;
     const room = await roomModel; await ensureRoomModelKnown(room, signal);
     const model = currentModelContext(parsed.payload, recent, room);
-    const request = { reason: parsed.event === 'reroll' ? 'before-reroll' : 'before-send', userText, recentText: visibleConversationText(recent), model };
+    const request = { reason: parsed.event === 'reroll' ? 'before-reroll' : 'before-send', userText, recentText: visibleConversationText(recent), assistantText, model };
     const planned = selectAutoOoc(data, request);
     Object.assign(diag, { userChars: userText.length, modelDetected: planned.modelDetected, matched: planned.matched, selected: planned.selected, omitted: planned.omitted, bundleChars: planned.chars });
     if (needsModel) diag.model = { source: model.source, crackerModel: model.crackerModel, chatModelId: model.chatModelId, name: model.name || model.label };
@@ -928,11 +955,13 @@
       const reason = parsed.event === 'characterMessageGenerated' ? 'generation-completed' : /cancel/i.test(parsed.event) ? 'generation-cancelled' : /(?:error|failed)/i.test(parsed.event) ? 'generation-error' : '';
       if (!reason) return;
       const chatId = String(parsed.payload?.data?.chatId || parsed.payload?.chatId || '');
-      const sameChat = row => chatId ? String(row.chatId) === chatId : live.get(row.generationId)?.socket === socket;
-      for (const [generationId, row] of live) if (row.state === 'armed' && sameChat({ generationId, chatId: row.chatId })) row.ended = true;
-      scheduleCleanup(reason, sameChat);
+      endGenerations(reason, row => chatId ? String(row.chatId) === chatId : live.get(row.generationId)?.socket === socket);
     });
     socket.addEventListener('close', () => scheduleCleanup('socket-close', row => live.get(row.generationId)?.socket === socket || staleEnough(row)));
+  }
+  function endGenerations(reason, sameChat, delay = 0) {
+    for (const [generationId, row] of live) if (row.state === 'armed' && sameChat({ generationId, chatId: row.chatId })) row.ended = true;
+    scheduleCleanup(reason, sameChat, delay);
   }
   function looksLikeWishWrapper(fn) {
     try { return /sendNeedsPreparation|generationGates|WishHistory/.test(Function.prototype.toString.call(fn)); } catch { return false; }
@@ -949,6 +978,8 @@
     function autoOocSend(data) {
       watchAutoSocket(this);
       const parsed = parseSocketFrame(data), chatId = String(parsed?.payload?.chatId || parsed?.payload?.data?.chatId || '');
+      // 사용자가 생성을 멈추면 Crack은 { chatId }만 담은 stop을 보낸다. frame은 그대로 넘기고, 남은 block은 잠시 뒤 정리한다.
+      if (parsed?.event === 'stop' && chatId) endGenerations('generation-stopped', row => String(row.chatId) === chatId, 1000);
       if (!parsed || !['send', 'reroll'].includes(parsed.event) || !chatId || chatId !== currentChatId()) return previousSend.call(this, data);
       if (library && (!library.autoSettings.autoInjectionEnabled || !allEntries(library).some(entry => entry.autoInjection.enabled))) return previousSend.call(this, data);
       // 가로챈 frame은 어떤 경우에도 버리지 않는다. 같은 방의 frame은 들어온 순서대로 내보내고,
@@ -990,7 +1021,7 @@
     Object.defineProperty(W, '__CRACK_OOC_LIBRARY_TEST_API__', { configurable: true, value: {
       check, transport, selectAutoOoc, stableCarrierFrame, selectAutoCarrier, detectWish, removeAutoRegions, countAutoRegions, autoRegion, autoRegionOverhead,
       conditionSourceText, cleanupAutoRecord, cleanupChatResidues, injectAutoOoc, markerPattern, fitBundleForCarrier, loadResidues, diagnostics: autoDiagnostics, hookInfo, live,
-      modelGroups, legacyModelKey, refreshModelCatalog, currentModelContext,
+      modelOptions, legacyModelKey, refreshModelCatalog, currentModelContext, visibleAssistantText,
     } });
   }
   function backup(data) {
@@ -1022,10 +1053,10 @@
     toolbar.append(search, action('OOC 추가', () => editOoc(), 'plus'), action('카테고리 추가', () => editFolder(), 'folderPlus'));
     toolbar.querySelectorAll('button').forEach(button => { button.disabled = saving; }); view.body.append(toolbar, rows); drawTree(rows, query);
   }
-  function row(title, location, edit, remove, auto = false) {
+  function row(title, location, edit, remove, badge = '') {
     const root = node('div', 'oa-row'); root.dataset.kind = location.kind;
     const symbol = node('span', 'oa-symbol'); symbol.innerHTML = svg(location.kind === 'folder' ? 'folder' : 'file'); root.append(symbol, node('span', 'oa-name', title));
-    if (auto) root.append(node('span', 'oa-auto-badge', '자동'));
+    if (badge) root.append(node('span', badge === '자동' ? 'oa-auto-badge' : 'oa-auto-badge oa-review-badge', badge));
     const tools = node('div', 'oa-row-actions'); const handle = action('순서 변경', () => {}, 'grip'); handle.dataset.sort = '';
     handle.addEventListener('pointerdown', event => startDrag(event, root, location));
     tools.append(handle);
@@ -1035,6 +1066,7 @@
   }
   function drawTree(root, query) {
     root.replaceChildren(); const data = editing || library, needle = query.trim().toLocaleLowerCase();
+    const badgeOf = item => item.autoInjection.legacyCondition ? '확인 필요' : item.autoInjection.enabled ? '자동' : '';
     const matches = item => [item.name, item.content, item.autoInjection.conditionValue, item.autoInjection.modelName].some(value => String(value || '').toLocaleLowerCase().includes(needle));
     data.categories.forEach((folder, category) => {
       const { name, items } = folder, folderMatch = name.toLocaleLowerCase().includes(needle);
@@ -1047,7 +1079,7 @@
       header.querySelector('.oa-name').onclick = toggle.onclick;
       const count = node('span', 'oa-count', String(items.length)); header.insertBefore(count, header.lastChild);
       items.forEach((item, index) => { if (!needle || folderMatch || matches(item)) {
-        const element = row(item.name, { kind: 'ooc', category, index }, () => editOoc(category, index), () => deleteEntry(category, index), item.autoInjection.enabled); children.append(element); dropTarget(element, { kind: 'ooc', category, index });
+        const element = row(item.name, { kind: 'ooc', category, index }, () => editOoc(category, index), () => deleteEntry(category, index), badgeOf(item)); children.append(element); dropTarget(element, { kind: 'ooc', category, index });
       } });
       if (!items.length) children.append(node('div', 'oa-empty'));
       dropTarget(header, { kind: 'folder', category }); dropTarget(children, { kind: 'ooc', category, index: items.length }, true);
@@ -1057,7 +1089,7 @@
     });
     const extras = node('section', 'oa-extras');
     data.extras.forEach((item, index) => { if (matches(item)) {
-      const element = row(item.name, { kind: 'ooc', category: -1, index }, () => editOoc(-1, index), () => deleteEntry(-1, index), item.autoInjection.enabled); extras.append(element); dropTarget(element, { kind: 'ooc', category: -1, index });
+      const element = row(item.name, { kind: 'ooc', category: -1, index }, () => editOoc(-1, index), () => deleteEntry(-1, index), badgeOf(item)); extras.append(element); dropTarget(element, { kind: 'ooc', category: -1, index });
     } });
     if (!data.extras.length) extras.append(node('div', 'oa-empty')); dropTarget(extras, { kind: 'ooc', category: -1, index: data.extras.length }, true); root.append(extras);
   }
@@ -1126,25 +1158,23 @@
     folder.append(new Option('미분류', '-1')); data.categories.forEach((item, index) => folder.append(new Option(item.name, String(index)))); folder.value = String(category);
     const autoArea = node('section', 'oa-auto-editor'); autoArea.append(node('h3', '', '자동주입'));
     const enabled = toggleField(autoArea, '이 OOC 자동주입', rule.enabled, '위의 내용을 그대로 씁니다. 보관함에서 위에 있는 OOC부터 들어가며, USER 입력문에는 붙이지 않습니다.');
+    if (rule.legacyCondition) autoArea.append(node('p', 'oa-message oa-warning', '이 OOC는 예전의 "USER 입력 글자수" 조건을 쓰고 있었습니다. 그 조건은 없어졌고 "AI 응답 글자수"로 옮겨 두었지만 뜻이 달라 자동주입은 꺼 두었습니다. 조건값을 확인한 뒤 다시 켜고 적용해 주세요.'));
     const condition = field(autoArea, '조건 유형', 'select');
-    for (const [value, label] of [['always', '항상'], ['model', '모델'], ['userLength', 'USER 입력 글자수'], ['keyword', '키워드/트리거']]) condition.append(new Option(label, value));
+    for (const [value, label] of [['always', '항상'], ['model', '모델'], ['assistantLength', 'AI 응답 글자수'], ['keyword', '키워드/트리거']]) condition.append(new Option(label, value));
     condition.value = rule.conditionType;
     // 모델은 Crack이 내려주는 실제 목록에서 고른다. 2.0.2.x에서 직접 입력한 문자열은 목록과 정확히 맞으면 바꿔 주고, 아니면 그대로 둘 수 있다.
     const legacyModel = rule.conditionType === 'model' && !rule.modelKey ? rule.conditionValue : '';
     let chosenModel = rule.modelKey || (legacyModel ? LEGACY_MODEL_OPTION : '');
     const model = field(autoArea, '대상 모델', 'select');
-    const knownModels = () => modelGroups().flatMap(group => group.options);
+    const knownModels = () => modelOptions();
     function drawModels(state) {
       if (chosenModel === LEGACY_MODEL_OPTION) chosenModel = legacyModelKey(legacyModel) || LEGACY_MODEL_OPTION;
-      const groups = modelGroups(); model.replaceChildren();
-      model.append(new Option(groups.length ? '모델 선택' : state === 'loading' ? '모델 목록을 불러오는 중…' : '모델 목록을 불러오지 못했습니다', ''));
-      for (const group of groups) {
-        const box = node('optgroup'); box.label = group.label;
-        for (const option of group.options) if (!option.retired || option.key === chosenModel) box.append(new Option(option.retired ? `${option.name} (종료된 모델)` : option.name, option.key));
-        if (box.children.length) model.append(box);
-      }
+      const options = modelOptions(); model.replaceChildren();
+      model.append(new Option(options.length ? '모델 선택' : state === 'loading' ? '모델 목록을 불러오는 중…' : '모델 목록을 불러오지 못했습니다', ''));
+      // 지금 Crack에서 고를 수 있는 유료 모델만 한 목록으로 보여 준다. 이미 저장돼 있던 값이 종료·무료 모델이면 그 항목 하나만 표시용으로 덧붙인다.
+      for (const option of options) if (option.selectable || option.key === chosenModel) model.append(new Option(option.selectable ? option.label : `${option.label} (${option.retired ? '종료된 모델' : '선택 대상 아님'})`, option.key));
       if (chosenModel === LEGACY_MODEL_OPTION) model.append(new Option(`기존 입력값 유지: ${legacyModel}`, LEGACY_MODEL_OPTION));
-      else if (chosenModel && !knownModels().some(option => option.key === chosenModel)) model.append(new Option(`${rule.modelName || chosenModel} (현재 목록에 없음)`, chosenModel));
+      else if (chosenModel && !options.some(option => option.key === chosenModel)) model.append(new Option(`${rule.modelName || chosenModel} (현재 목록에 없음)`, chosenModel));
       model.value = chosenModel;
     }
     model.addEventListener('change', () => { chosenModel = model.value; });
@@ -1158,8 +1188,8 @@
     function syncConditionUi() {
       const type = condition.value; scope.closest('.oa-field').hidden = type !== 'keyword'; model.closest('.oa-field').hidden = type !== 'model';
       conditionValue.closest('.oa-field').hidden = type === 'always' || type === 'model';
-      conditionValue.placeholder = type === 'userLength' ? '예: 500+, 800~1500, 1500 이상' : '쉼표 또는 줄바꿈으로 여러 키워드';
-      hint.textContent = type === 'model' ? '이 방에서 지금 선택된 모델과 비교합니다. 모델을 확인하지 못한 턴에는 이 OOC만 빠집니다.' : type === 'userLength' ? '현재 전송하려는 USER 문자열의 JavaScript length를 로컬에서 계산합니다. 에리 로어 블록 등 다른 확장이 붙인 내용은 세지 않습니다.' : type === 'keyword' ? '대소문자를 구분하지 않는 포함 검색입니다.' : '매 전송/리롤의 자동주입 후보가 됩니다.';
+      conditionValue.placeholder = type === 'assistantLength' ? '예: 2000 이상, 2500+, 1000~2000, 1500 이하' : '쉼표 또는 줄바꿈으로 여러 키워드';
+      hint.textContent = type === 'model' ? '이 방에서 지금 선택된 모델과 비교합니다. 모델을 확인하지 못한 턴에는 이 OOC만 빠집니다.' : type === 'assistantLength' ? '직전 AI 응답의 글자수를 기준으로 자동주입합니다. 리롤 시에는 리롤하려는 AI 응답의 기존 길이를 사용합니다. 다른 확장이 붙인 숨은 내용은 세지 않습니다.' : type === 'keyword' ? '대소문자를 구분하지 않는 포함 검색입니다.' : '매 전송/리롤의 자동주입 후보가 됩니다.';
     }
     condition.addEventListener('change', syncConditionUi); syncConditionUi();
     view.footer.append(action('취소', view.close), action('적용', () => {
@@ -1170,7 +1200,7 @@
         else if (chosenModel) { modelKey = chosenModel; modelName = knownModels().find(option => option.key === chosenModel)?.name || rule.modelName || ''; }
         if (enabled.checked && !modelKey && !value) throw Error('대상 모델을 선택하세요.');
       } else if (enabled.checked && type !== 'always' && !value) throw Error('선택한 자동주입 조건값을 입력하세요.');
-      if (type === 'userLength' && !parseLengthCondition(value)) throw Error('글자수 조건은 500+, 800~1500, 1500 이상처럼 입력하세요.');
+      if (type === 'assistantLength' && !parseLengthCondition(value)) throw Error('글자수 조건은 2000 이상, 2500+, 1000~2000, 1500 이하처럼 입력하세요.');
       change(data => {
         const to = Number(folder.value), entry = { id: current.id, name: title, content: body.value, autoInjection: normalizeAuto({ enabled: enabled.checked, conditionType: type, conditionValue: value, keywordScope: scope.value, modelKey, modelName }) };
         if (index === undefined) contents(data, to).push(entry);
@@ -1203,6 +1233,7 @@
       if (result.selected.length) previewList.append(node('small', '', `보관함 순서대로 적용 · 예상 ${result.chars.toLocaleString()}자 / 최대 ${result.maxChars.toLocaleString()}자`));
       const overBudget = result.omitted.filter(item => item.reason === 'over-budget');
       if (overBudget.length) previewList.append(node('small', '', `한도 때문에 제외: ${overBudget.map(item => item.name).join(', ')}`));
+      if (allEntries(draft).some(item => item.autoInjection.enabled && item.autoInjection.conditionType === 'assistantLength')) previewList.append(node('small', '', typeof context.assistantText === 'string' ? `직전 AI 응답: ${context.assistantText.length.toLocaleString()}자` : '직전 AI 응답을 찾지 못해 글자수 조건 OOC는 빠집니다.'));
       if (allEntries(draft).some(item => item.autoInjection.enabled && item.autoInjection.conditionType === 'model')) previewList.append(node('small', '', result.modelDetected ? `현재 모델: ${context.model?.name || context.model?.label || context.model?.crackerModel || '확인됨'}` : '현재 모델을 확인하지 못해 모델 조건 OOC는 빠집니다.'));
       if (context.frame) {
         const choice = selectAutoCarrier(context.frame, detectWish(draft, context.frame.messages).separate);
@@ -1252,7 +1283,7 @@
       const [messages, room] = await Promise.all([fetchRecentMessages(chatId, controller.signal, 30), fetchRoomModel(chatId, controller.signal).catch(() => null), refreshModelCatalog(controller.signal).catch(() => [])]);
       let frame = null; try { frame = stableCarrierFrame(messages); } catch { /* carrier 표시만 생략한다. */ }
       await ensureRoomModelKnown(room, controller.signal);
-      return { ...base, chatId, frame, userText: conditionSourceText(base.userText), recentText: visibleConversationText(messages), model: currentModelContext(null, messages, room) };
+      return { ...base, chatId, frame, userText: conditionSourceText(base.userText), recentText: visibleConversationText(messages), assistantText: frame?.latest ? visibleAssistantText(messageTextOf(frame.latest)) : null, model: currentModelContext(null, messages, room) };
     } catch (error) {
       console.info('[Crack OOC 보관함] 미리보기 최근 대화 조회 생략', error);
       return { ...base, chatId };
@@ -1460,8 +1491,8 @@
     .oa-dialog{--oa-bg:hsl(var(--card,0 0% 9%));--oa-fg:hsl(var(--foreground,0 0% 98%));--oa-muted:hsl(var(--muted-foreground,0 0% 58%));--oa-line:hsl(var(--border,0 0% 22%));--oa-accent:#a5a0f5;color:var(--oa-fg);background:var(--oa-bg);border:1px solid var(--oa-line);border-radius:16px;padding:0;width:min(520px,calc(100vw - 32px));max-height:86vh;box-shadow:0 24px 80px #0007;font:14px/1.5 system-ui}
     .oa-dialog [hidden]{display:none!important}.oa-dialog::backdrop{background:#0007}.oa-dialog.oa-large{width:min(680px,calc(100vw - 32px))}.oa-dialog.oa-guide{width:min(620px,calc(100vw - 32px))}.oa-header{display:flex;align-items:center;gap:8px;height:64px;padding:0 20px;border-bottom:1px solid var(--oa-line)}.oa-header strong{font-size:16px;font-weight:650}.oa-header>.oa-icon{margin-left:auto}.oa-actions{display:flex;gap:4px;margin-left:auto}.oa-dot{width:7px;height:7px;background:#f06b73;border-radius:50%}.oa-body{padding:20px;overflow:auto;max-height:calc(86vh - 142px)}.oa-large .oa-body{min-height:260px;max-height:calc(86vh - 66px)}.oa-footer{display:flex;justify-content:flex-end;gap:8px;padding:12px 20px;border-top:1px solid var(--oa-line)}
     .oa-dialog button{font:inherit;cursor:pointer}.oa-icon{display:inline-flex;align-items:center;justify-content:center;width:32px;height:32px;padding:6px;border:0;border-radius:6px;background:transparent;color:var(--oa-muted,currentColor);flex-shrink:0}.oa-icon svg, .oa-symbol svg,.oa-search svg,.oa-toggle svg,.oa-list-folder svg{width:20px;height:20px;display:block;flex-shrink:0}.oa-icon:hover,.oa-toggle:hover{background:#8882;color:var(--oa-fg,inherit)}.oa-dialog button:disabled{opacity:.35;cursor:default}.oa-dialog button:focus-visible,.oa-dialog summary:focus-visible{outline:2px solid var(--oa-accent);outline-offset:2px}.oa-button{border:1px solid var(--oa-line);background:transparent;color:inherit;border-radius:8px;padding:7px 14px}.oa-primary{background:var(--oa-accent);color:#171724;border-color:transparent}.oa-toolbar{display:flex;align-items:center;gap:6px;margin-bottom:14px}.oa-search{display:flex;align-items:center;gap:8px;flex:1;border:1px solid var(--oa-line);border-radius:8px;padding:0 10px;color:var(--oa-muted)}
-    .oa-dialog input,.oa-dialog textarea,.oa-dialog select{color:inherit;background:transparent;border:1px solid var(--oa-line);border-radius:8px;padding:9px 10px;font:inherit;width:100%;box-sizing:border-box;min-width:0}.oa-search input{border:0;outline:none;padding:9px 0}.oa-field{display:flex;flex-direction:column;gap:7px;margin-bottom:16px}.oa-field>span{font-size:13px;color:var(--oa-muted)}.oa-dialog textarea{resize:vertical;white-space:pre-wrap}.oa-dialog select option{color:#eee;background:#222}.oa-dialog select optgroup{color:#aaa;background:#222;font-style:normal}.oa-toggle-field{display:grid;grid-template-columns:auto 1fr;gap:4px 9px;align-items:center;margin:0 0 16px}.oa-toggle-field input{width:18px;height:18px}.oa-toggle-field small{grid-column:2;color:var(--oa-muted);line-height:1.45}.oa-hint{margin:-8px 0 14px;color:var(--oa-muted);font-size:12px;line-height:1.5}.oa-auto-editor,.oa-settings-section{border-top:1px solid var(--oa-line);padding-top:16px;margin-top:4px}.oa-settings-section{border:1px solid var(--oa-line);border-radius:10px;padding:14px;margin-bottom:22px}.oa-preview{margin-top:12px;padding:10px;border-radius:8px;background:#8881}.oa-preview strong{display:block;margin-bottom:6px}.oa-preview-list{white-space:pre-wrap}.oa-preview-list small{display:block;color:var(--oa-muted);margin-top:6px}.oa-muted{color:var(--oa-muted)}.oa-diagnostics{margin-top:12px}.oa-diagnostics summary{cursor:pointer;color:var(--oa-muted);font-size:12px}.oa-diagnostics pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#8881;border-radius:6px;padding:10px;margin:8px 0 0;font-size:11px;max-height:240px;overflow:auto}
-    .oa-group{margin:8px 0;border:1px solid var(--oa-line);border-radius:10px;overflow:visible}.oa-group>.oa-row{background:#8881;border-radius:9px}.oa-row{position:relative;display:flex;align-items:center;gap:9px;min-height:44px;padding:4px 8px;box-sizing:border-box}.oa-name{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.oa-group>.oa-row>.oa-name{font-weight:600;cursor:pointer}.oa-symbol{color:var(--oa-muted);flex-shrink:0}.oa-group>.oa-row>.oa-symbol{color:#c4b391}.oa-count{color:var(--oa-muted);font-size:12px}.oa-auto-badge{font-size:11px;color:#b9b5ff;border:1px solid #a5a0f555;border-radius:999px;padding:1px 6px}.oa-row-actions{display:flex;gap:2px}.oa-row-actions .oa-icon{width:28px;height:28px;padding:5px}.oa-row-actions .oa-icon[data-sort]{cursor:grab;touch-action:none}.oa-toggle{width:20px;height:28px;border:0;padding:0;background:transparent;color:var(--oa-muted);flex-shrink:0}.oa-toggle svg{width:16px;height:16px;transition:transform .15s}.oa-open .oa-toggle svg{transform:rotate(90deg)}.oa-children{margin:0 12px 10px 30px;padding-left:8px;border-left:2px solid var(--oa-line)}.oa-children .oa-row+.oa-row{border-top:1px solid #8882}.oa-extras{margin-top:14px}.oa-extras>.oa-row{border-bottom:1px solid #8882}.oa-empty{height:28px}.oa-before::before,.oa-after::after{content:'';position:absolute;left:0;right:0;height:3px;background:var(--oa-accent);border-radius:3px;z-index:2;pointer-events:none}.oa-before::before{top:0}.oa-after::after{bottom:0}.oa-children,.oa-extras{position:relative}.oa-dragging{opacity:.3}.oa-ghost{position:fixed;pointer-events:none;z-index:3;background:var(--oa-bg);border:1px solid var(--oa-line);border-radius:8px;box-shadow:0 8px 24px #0006;opacity:.95}
+    .oa-dialog input,.oa-dialog textarea,.oa-dialog select{color:inherit;background:transparent;border:1px solid var(--oa-line);border-radius:8px;padding:9px 10px;font:inherit;width:100%;box-sizing:border-box;min-width:0}.oa-search input{border:0;outline:none;padding:9px 0}.oa-field{display:flex;flex-direction:column;gap:7px;margin-bottom:16px}.oa-field>span{font-size:13px;color:var(--oa-muted)}.oa-dialog textarea{resize:vertical;white-space:pre-wrap}.oa-dialog select option{color:#eee;background:#222}.oa-toggle-field{display:grid;grid-template-columns:auto 1fr;gap:4px 9px;align-items:center;margin:0 0 16px}.oa-toggle-field input{width:18px;height:18px}.oa-toggle-field small{grid-column:2;color:var(--oa-muted);line-height:1.45}.oa-hint{margin:-8px 0 14px;color:var(--oa-muted);font-size:12px;line-height:1.5}.oa-auto-editor,.oa-settings-section{border-top:1px solid var(--oa-line);padding-top:16px;margin-top:4px}.oa-settings-section{border:1px solid var(--oa-line);border-radius:10px;padding:14px;margin-bottom:22px}.oa-preview{margin-top:12px;padding:10px;border-radius:8px;background:#8881}.oa-preview strong{display:block;margin-bottom:6px}.oa-preview-list{white-space:pre-wrap}.oa-preview-list small{display:block;color:var(--oa-muted);margin-top:6px}.oa-muted{color:var(--oa-muted)}.oa-diagnostics{margin-top:12px}.oa-diagnostics summary{cursor:pointer;color:var(--oa-muted);font-size:12px}.oa-diagnostics pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#8881;border-radius:6px;padding:10px;margin:8px 0 0;font-size:11px;max-height:240px;overflow:auto}
+    .oa-group{margin:8px 0;border:1px solid var(--oa-line);border-radius:10px;overflow:visible}.oa-group>.oa-row{background:#8881;border-radius:9px}.oa-row{position:relative;display:flex;align-items:center;gap:9px;min-height:44px;padding:4px 8px;box-sizing:border-box}.oa-name{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.oa-group>.oa-row>.oa-name{font-weight:600;cursor:pointer}.oa-symbol{color:var(--oa-muted);flex-shrink:0}.oa-group>.oa-row>.oa-symbol{color:#c4b391}.oa-count{color:var(--oa-muted);font-size:12px}.oa-auto-badge{font-size:11px;color:#b9b5ff;border:1px solid #a5a0f555;border-radius:999px;padding:1px 6px;white-space:nowrap}.oa-review-badge{color:#ed969e;border-color:#eb6b7466}.oa-row-actions{display:flex;gap:2px}.oa-row-actions .oa-icon{width:28px;height:28px;padding:5px}.oa-row-actions .oa-icon[data-sort]{cursor:grab;touch-action:none}.oa-toggle{width:20px;height:28px;border:0;padding:0;background:transparent;color:var(--oa-muted);flex-shrink:0}.oa-toggle svg{width:16px;height:16px;transition:transform .15s}.oa-open .oa-toggle svg{transform:rotate(90deg)}.oa-children{margin:0 12px 10px 30px;padding-left:8px;border-left:2px solid var(--oa-line)}.oa-children .oa-row+.oa-row{border-top:1px solid #8882}.oa-extras{margin-top:14px}.oa-extras>.oa-row{border-bottom:1px solid #8882}.oa-empty{height:28px}.oa-before::before,.oa-after::after{content:'';position:absolute;left:0;right:0;height:3px;background:var(--oa-accent);border-radius:3px;z-index:2;pointer-events:none}.oa-before::before{top:0}.oa-after::after{bottom:0}.oa-children,.oa-extras{position:relative}.oa-dragging{opacity:.3}.oa-ghost{position:fixed;pointer-events:none;z-index:3;background:var(--oa-bg);border:1px solid var(--oa-line);border-radius:8px;box-shadow:0 8px 24px #0006;opacity:.95}
     .oa-message{white-space:pre-line;margin:0 0 14px;line-height:1.7}.oa-warning{color:#ed969e;background:#eb6b7410;border:1px solid #eb6b7440;border-radius:8px;padding:12px}.oa-source-options{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin:14px 0}.oa-source{display:flex;flex-direction:column;align-items:flex-start;gap:8px;padding:14px}.oa-source span{font-size:12px;color:var(--oa-muted)}.oa-source.oa-selected{border-color:var(--oa-accent);background:#a5a0f512}.oa-backup{display:flex;gap:8px}.oa-body h3{margin:0 0 14px;font-size:14px}.oa-db-top{display:flex;align-items:center;gap:8px;margin-bottom:16px}.oa-segment{display:flex;padding:3px;border-radius:9px;background:#8882;flex:1}.oa-segment label{flex:1;text-align:center;cursor:pointer}.oa-segment input{position:absolute;opacity:0;width:1px;height:1px}.oa-segment span{display:block;border-radius:6px;padding:7px 12px;color:var(--oa-muted)}.oa-segment input:checked+span{color:var(--oa-fg);background:var(--oa-bg);box-shadow:0 1px 4px #0003}.oa-segment input:focus-visible+span{outline:2px solid var(--oa-accent)}.oa-credentials{display:grid;grid-template-columns:minmax(0,1.2fr) minmax(0,1fr) auto;gap:8px;align-items:center}.oa-credentials .oa-button{padding:9px 12px}.oa-auth-state{font-size:12px;color:var(--oa-muted);min-height:18px;margin:10px 0 0}.oa-guide-section{border-bottom:1px solid var(--oa-line);padding:12px 0}.oa-guide-section:first-child{padding-top:0}.oa-guide-section summary{cursor:pointer;font-weight:600}.oa-guide-section ol{padding-left:23px}.oa-guide-section li{margin:8px 0;line-height:1.7}.oa-guide-section pre{white-space:pre-wrap;background:#8881;border-radius:6px;padding:10px;font-size:12px}.oa-guide-section small{color:var(--oa-muted);overflow-wrap:anywhere}
     .oa-native-hidden{display:none!important}.oa-tabs{overflow-x:auto!important;overflow-y:hidden!important;flex-wrap:nowrap!important}.oa-tab{background:transparent;border:0;border-bottom:2px solid transparent;padding:0 8px 8px;margin-bottom:-1px;flex-shrink:0;font-size:14px;font-weight:var(--oa-tab-weight,400);color:var(--oa-tab-color,inherit);white-space:nowrap;border-radius:0}.oa-tab.oa-tab-active{border-bottom-color:currentColor;font-weight:var(--oa-tab-active-weight,600);color:var(--oa-tab-active-color,inherit)}.oa-panel-config{width:28px;height:28px;margin-bottom:6px}.oa-panel-body{min-height:0;flex:1;overflow:auto;padding:8px 16px;font-size:14px}.oa-panel-body[hidden]{display:none}.oa-use{display:block;border:0;background:transparent;color:inherit;padding:8px;width:100%;text-align:left;border-radius:6px;font-size:14px}.oa-use:hover{background:#8882}.oa-list-folder summary{display:flex;align-items:center;gap:8px;padding:8px 0;cursor:pointer;font-weight:600;list-style:none}.oa-list-folder summary::-webkit-details-marker{display:none}.oa-list-folder summary svg:first-child{width:14px;height:14px}.oa-list-folder[open] summary svg:first-child{transform:rotate(90deg)}.oa-list-folder>.oa-use{margin-left:20px;width:calc(100% - 20px);padding-left:12px;border-left:2px solid #8884;border-radius:0}
     @media(max-width:480px){.oa-header{padding:0 12px}.oa-body{padding:14px}.oa-row-actions{gap:0}.oa-children{margin-left:22px}.oa-credentials{gap:5px}.oa-credentials input{padding:8px 6px}.oa-credentials .oa-button{padding:8px}.oa-source-options{gap:6px}.oa-source{padding:10px}}
