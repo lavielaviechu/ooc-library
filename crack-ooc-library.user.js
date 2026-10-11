@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Crack OOC 보관함
 // @namespace    crack.ooc.library
-// @version      3.0.1.0
+// @version      3.0.2.0
 // @description  OOC를 보관하고 안전한 assistant carrier에 독립적으로 자동 컨텍스트를 주입 (version 관리방식: 데이터구조버전.크랙UI변경.기능추가및수정.버그수정)
 // @match        https://crack.wrtn.ai/*
 // @noframes
@@ -45,11 +45,15 @@
  * - 3.0.1.0: 자료 구조는 그대로다. 상황 감지 API 설정에서 recentMessages / timeoutMs를 없앴다 (최근 메시지 6개, 3초로 고정).
  *   localStorage에 남은 예전 값은 읽지 않고 다음 "API 설정 저장" 때 빠진다. 설정의 전체 백업/전체 복원(JSON 파일)을 없앴다.
  *
+ * - 3.0.2.0: 자료 구조는 그대로다. 기본값이 바뀌었다: autoSettings.autoInjectionEnabled와 새 OOC의 autoInjection.enabled는 값이 없을 때 true다.
+ *   저장된 false는 그대로 false다. v1에서 옮긴 항목, autoInjection이 아예 없는 항목, 예전 userLength 조건 항목은 계속 꺼 둔다.
+ *
  * 자동 OOC (2.0.2.0)
  * - USER 메시지와 WebSocket payload는 읽기만 한다. 자동 OOC는 과거 assistant 메시지(carrier) 끝에
  *   generation 동안만 숨김 주석으로 붙였다가, 완료 후 서버의 최신 본문에서 자기 marker 구간만 제거한다.
  * - WRMC가 감지되면 WRMC stableFrame이 고를 carrier와 WISH marker가 있는 메시지를 피해 별도 carrier를 쓴다.
- * - 독립 carrier가 없거나 어떤 단계든 실패하면 그 generation의 자동 OOC만 건너뛰고 원래 전송은 그대로 보낸다.
+ * - 3.0.2.0: 독립 carrier가 없으면 RP Manager가 쓰는 답변을 함께 쓴다 (shared). 서버의 지금 본문 전체를 그대로 두고 맨 뒤에 AUTO 구간만 붙였다 뗀다.
+ * - 함께 쓸 답변도 없거나 어떤 단계든 실패하면 그 generation의 자동 OOC만 건너뛰고 원래 전송은 그대로 보낸다.
  * - hook 설치 순서(WRMC/에리 wrapper의 안쪽·바깥쪽)는 동작 조건이 아니다. 실제 위치는 진단에만 표시한다.
  */
 (() => {
@@ -71,6 +75,12 @@
   const LOAD_RECOVERY_MIN_AGE_MS = 20000;
   const RESIDUE_MAX_AGE_MS = 14 * 24 * 60 * 60 * 1000;
   const CARRIER_SEARCH_DEPTH = 4;
+  // carrier를 쓰는 방식. separate: 다른 도구가 쓰지 않는 과거 AI 답변. shared: 독립된 답변이 없어 RP Manager가 쓰는 답변 끝에 함께 붙인다.
+  const CARRIER_SEPARATE = 'separate', CARRIER_SHARED = 'shared-rp-manager';
+  // 읽고 쓰는 사이에 다른 도구가 같은 메시지를 고쳤을 때 최신 본문으로 다시 해 보는 횟수.
+  const CARRIER_CONFLICT_RETRIES = 2;
+  // shared carrier는 응답 스트림 frame이 처음보다 이만큼(글자) 길어지면 뗀다.
+  const SHARED_RELEASE_GROWTH = 20;
   const SAMPLE_GENERATION_ID = '0'.repeat(36);
   // 미리보기에서 generation id 자리에 넣는 값. 실제 id(UUID 36자)와 길이가 같아 글자수 계산이 실제 전송과 같다.
   const PREVIEW_GENERATION_ID = 'PREVIEW_ONLY_NOT_A_REAL_GENERATION'.padEnd(36, '_');
@@ -92,8 +102,9 @@
   // Crack chat-models API가 받는 serviceType 값과 dropdown 묶음 이름.
   const MODEL_SERVICES = [['story', '스토리'], ['character', '캐릭터'], ['partyChat', '파티챗']];
   const LEGACY_MODEL_OPTION = '__legacy__';
-  const AUTO_DEFAULTS = Object.freeze({ enabled: false, conditions: Object.freeze([]) });
-  const SETTINGS_DEFAULTS = Object.freeze({ autoInjectionEnabled: false, autoOocMaxChars: 2000, wrmcCarrierMode: 'auto' });
+  // 값이 적혀 있지 않을 때만 쓰는 기본값이다 (새 보관함, 새 OOC). 저장된 false를 true로 바꾸지 않는다.
+  const AUTO_DEFAULTS = Object.freeze({ enabled: true, conditions: Object.freeze([]) });
+  const SETTINGS_DEFAULTS = Object.freeze({ autoInjectionEnabled: true, autoOocMaxChars: 2000, wrmcCarrierMode: 'auto' });
   const fresh = () => ({ schemaVersion: SCHEMA_VERSION, updatedAt: 0, autoSettings: { ...SETTINGS_DEFAULTS }, categories: [], extras: [] });
   const copy = value => JSON.parse(JSON.stringify(value));
   const one = value => Object.entries(value)[0];
@@ -136,9 +147,12 @@
     return { type, value: text };
   }
   // autoInjection = { enabled, conditions: [...] }. 조건은 모두 만족해야 한다(AND). 조건이 없으면 "항상"이다.
+  // enabled가 적혀 있으면 그 값을 그대로 지킨다 (사용자가 끈 것은 꺼진 채다). 적혀 있지 않으면 새 OOC로 보고 기본값(켜짐)을 쓴다.
+  // 단, 예전 모양(conditionType 하나)이나 확인이 필요한 예전 조건인데 enabled가 없으면 켜지 않는다.
   function normalizeAuto(value = {}) {
     const src = value && typeof value === 'object' && !Array.isArray(value) ? value : {};
-    let enabled = src.enabled === true, legacy = src.legacyCondition === 'userLength', conditions;
+    const stated = Object.prototype.hasOwnProperty.call(src, 'enabled'), legacyShape = !Array.isArray(src.conditions) && src.conditionType != null;
+    let legacy = src.legacyCondition === 'userLength', enabled = stated ? src.enabled === true : !legacyShape && !legacy && AUTO_DEFAULTS.enabled, conditions;
     if (Array.isArray(src.conditions)) conditions = src.conditions.map(normalizeCondition).filter(Boolean);
     else {
       // schemaVersion 2 이하: 조건 하나(conditionType / conditionValue / keywordScope / modelKey / modelName)를 배열로 옮긴다.
@@ -154,10 +168,11 @@
     const legacyCondition = legacy && !enabled ? 'userLength' : '';
     return { enabled, conditions, ...(legacyCondition ? { legacyCondition } : {}) };
   }
+  // autoInjectionEnabled도 같다: 적혀 있으면 그 값(false는 계속 false), 적혀 있지 않으면 기본값(켜짐).
   function normalizeSettings(value = {}) {
     const src = value && typeof value === 'object' && !Array.isArray(value) ? value : {};
     const max = Number(src.autoOocMaxChars);
-    return { autoInjectionEnabled: src.autoInjectionEnabled === true,
+    return { autoInjectionEnabled: Object.prototype.hasOwnProperty.call(src, 'autoInjectionEnabled') ? src.autoInjectionEnabled === true : SETTINGS_DEFAULTS.autoInjectionEnabled,
       autoOocMaxChars: Number.isSafeInteger(max) ? Math.max(0, Math.min(50000, max)) : SETTINGS_DEFAULTS.autoOocMaxChars,
       wrmcCarrierMode: WRMC_MODES.includes(src.wrmcCarrierMode) ? src.wrmcCarrierMode : SETTINGS_DEFAULTS.wrmcCarrierMode };
   }
@@ -171,14 +186,16 @@
     // 예전 "주입용 본문"은 더 쓰지 않는다. 단, 내용이 비어 있고 주입용 본문만 있던 항목은 그 글이 사라지지 않게 내용으로 옮긴다.
     const legacyBody = value.autoInjection?.injectionBody;
     const content = !value.content.trim() && typeof legacyBody === 'string' && legacyBody.trim() ? legacyBody : value.content;
-    return { id, name, content, autoInjection: normalizeAuto(value.autoInjection) };
+    // autoInjection이 아예 없는 항목은 자동주입이 생기기 전의 자료다. v1 이관과 같이 꺼 둔다 (새 OOC는 편집창이 항상 값을 적어 넣는다).
+    return { id, name, content, autoInjection: normalizeAuto(value.autoInjection ?? { enabled: false }) };
   }
   function migrateV1(value) {
     const used = new Set();
     const legacyEntry = (item, path) => {
       if (!item || typeof item !== 'object' || Array.isArray(item) || Object.keys(item).length !== 1) throw Error('항목 형식이 올바르지 않습니다.');
       const [name, content] = one(item);
-      return normalizeEntry({ name, content, autoInjection: AUTO_DEFAULTS }, path, used);
+      // 이관된 기존 OOC의 자동주입은 항상 꺼 둔다. 기본값(켜짐)을 따르지 않는다.
+      return normalizeEntry({ name, content, autoInjection: { enabled: false, conditions: [] } }, path, used);
     };
     return { schemaVersion: SCHEMA_VERSION, updatedAt: value.updatedAt, autoSettings: { ...SETTINGS_DEFAULTS },
       categories: value.categories.map((item, category) => {
@@ -591,15 +608,20 @@
     if ((messages || []).some(message => hasWishMarker(messageTextOf(message)))) signals.push('marker');
     return { mode, signals, separate: mode === 'always' || mode !== 'never' && signals.length > 0 };
   }
+  // 순서: (1) 다른 도구가 쓰지 않는 독립된 답변 → separate. (2) 없으면 RP Manager가 쓰는(또는 쓸) 답변 가운데 가장 가까운 것 → shared.
+  // (3) 그것도 없으면 이번 generation의 자동 OOC만 건너뛴다. 후보는 언제나 stable 안쪽이라 최신 답변·리롤 대상은 들어오지 않는다.
+  // WISH marker가 있다는 것은 "독립 carrier로는 쓰지 않는다"는 뜻이지 "절대 쓰지 않는다"는 뜻이 아니다.
   function selectAutoCarrier(frame, separateFromWish) {
-    const predictedWishId = messageIdOf(frame.carrier), rejected = [];
-    for (const message of frame.stable.slice(0, CARRIER_SEARCH_DEPTH)) {
+    const predictedWishId = messageIdOf(frame.carrier), rejected = [], candidates = frame.stable.slice(0, CARRIER_SEARCH_DEPTH);
+    for (const message of candidates) {
       const id = messageIdOf(message), text = messageTextOf(message);
       const reason = separateFromWish && id === predictedWishId ? 'wrmc-predicted-carrier' : hasWishMarker(text) ? 'wish-marker' : !removeAutoRegions(text).trim() ? 'empty-body' : '';
-      if (!reason) return { carrier: message, carrierId: id, predictedWishId, rejected };
+      if (!reason) return { carrier: message, carrierId: id, mode: CARRIER_SEPARATE, predictedWishId, rejected };
       rejected.push({ id, reason });
     }
-    return { carrier: null, carrierId: '', predictedWishId, rejected };
+    // 함께 쓸 답변에는 AI가 실제로 쓴 본문이 있어야 한다 (RP 블록만 남은 메시지는 쓰지 않는다).
+    const shared = candidates.find((message, index) => rejected[index].reason !== 'empty-body' && visibleAssistantText(messageTextOf(message)));
+    return shared ? { carrier: shared, carrierId: messageIdOf(shared), mode: CARRIER_SHARED, predictedWishId, rejected } : { carrier: null, carrierId: '', mode: '', predictedWishId, rejected };
   }
   function accessToken() {
     const source = `; ${document.cookie || ''}`;
@@ -999,10 +1021,13 @@
     carrierLocks.set(key, task);
     return task.finally(() => { if (carrierLocks.get(key) === task) carrierLocks.delete(key); });
   }
+  // 읽기 → 계산 → 다시 읽어 그대로인지 확인 → PATCH → 다시 읽어 검증. 예전에 읽어 둔 본문으로 덮어쓰지 않는다:
+  // PATCH 직전에 본문이 달라져 있으면 쓰지 않고 최신 본문으로 처음부터 다시 계산한다 (CARRIER_CONFLICT_RETRIES번까지, record.retries에 횟수).
+  // 그래도 계속 바뀌면 'carrier-busy'로 물러난다. PATCH가 실패하거나 반영되지 않으면 다음 endpoint로 넘어간다.
   function mutateCarrier(record, build, verify, signal, hooks = {}) {
     return abortable(withCarrierLock(record, async () => {
-      const endpoints = patchEndpoints(record.chatId, record.messageId); let lastError = null;
-      for (let round = 0; round < endpoints.length; round++) {
+      const endpoints = patchEndpoints(record.chatId, record.messageId); let lastError = null, conflicts = 0;
+      for (let round = 0; round < endpoints.length;) {
         if (signal?.aborted) throw Object.assign(Error('자동 OOC 처리가 취소되었습니다.'), { code: 'AUTO_OOC_ABORT' });
         try {
           const currentMessage = await fetchCarrierMessage(record.chatId, record.messageId, signal);
@@ -1012,19 +1037,24 @@
           if (built.skip) return { skipped: true, text: current, built };
           // A second read immediately before PATCH narrows the non-atomic read/write window.
           const preflight = await fetchCarrierMessage(record.chatId, record.messageId, signal);
-          if (!preflight || messageTextOf(preflight) !== current) { lastError = Error('PATCH 직전 carrier 본문이 바뀌었습니다.'); continue; }
+          if (!preflight || messageTextOf(preflight) !== current) {
+            if (conflicts >= CARRIER_CONFLICT_RETRIES) throw skipInjection('carrier-busy', '다른 도구가 같은 메시지를 계속 고치고 있어 물러났습니다.');
+            record.retries = ++conflicts;
+            lastError = Error('PATCH 직전 carrier 본문이 바뀌었습니다.'); continue;
+          }
           await hooks.guard?.(current);
           hooks.beforePatch?.();
           await crackRequest('PATCH', endpoints[round], { message: built.text }, signal);
           record.patched = true;
           // HTTP 2xx만으로는 성공으로 치지 않는다. 일부 endpoint는 2xx 뒤에도 본문이 그대로다.
           const checked = await fetchCarrierMessage(record.chatId, record.messageId, signal), observed = checked ? messageTextOf(checked) : '';
-          if (verify(observed, built)) return { verified: true, text: observed, built };
+          if (verify(observed, built, current)) return { verified: true, text: observed, built };
           lastError = Error('PATCH 뒤 AUTO OOC marker 검증에 실패했습니다.');
         } catch (error) {
           if (error?.code === 'AUTO_OOC_SKIP' || error?.code === 'AUTO_OOC_ABORT') throw error;
           lastError = error;
         }
+        round++;
       }
       throw lastError || Error('AUTO OOC carrier PATCH에 실패했습니다.');
     }), signal);
@@ -1099,7 +1129,7 @@
   }
   function armGeneration(record, socket) {
     const generationId = record.generationId;
-    live.set(generationId, { chatId: record.chatId, state: 'armed', sentAt: Date.now(), lastStreamAt: 0, socket, baselineLatestId: record.baselineLatestId });
+    live.set(generationId, { chatId: record.chatId, state: 'armed', sentAt: Date.now(), lastStreamAt: 0, socket, baselineLatestId: record.baselineLatestId, shared: record.mode === CARRIER_SHARED });
     // 완료·오류 이벤트를 받지 못한 generation은 마지막 스트림 활동 뒤 120초에 정리한다.
     const tick = () => {
       const row = live.get(generationId); if (!row) return;
@@ -1146,14 +1176,22 @@
     return { request, model, assistantText, judged, planned, wish, choice };
   }
   // carrier의 지금 본문에서 PATCH에 실을 본문을 만든다. 실제 주입과 미리보기가 이 함수 하나로 같은 글을 만든다.
-  // WRMC가 이미 쓰고 있는 메시지면 물러난다. 남아 있던 AUTO 구간은 빼고 이번 것 하나만 붙인다.
-  function composeCarrier(data, request, current, generationId) {
-    if (hasWishMarker(current)) throw skipInjection('carrier-has-wish-marker');
+  // 어느 방식이든 지금 서버 본문을 그대로 두고 맨 뒤에 AUTO 구간 하나를 붙인다 (남아 있던 자기 AUTO 구간만 뺀다).
+  // - separate: 고른 뒤에 RP Manager가 이 메시지를 쓰기 시작했으면 물러난다.
+  // - shared: RP Manager의 블록을 포함한 본문 전체가 바탕이다. 그 블록을 고치거나 감싸거나 그 안에 넣지 않는다.
+  //   자기 marker 조각이 짝 없이 남아 있으면(손상) 건드리지 않는다.
+  function composeCarrier(data, request, current, generationId, mode = CARRIER_SEPARATE) {
     const base = removeAutoRegions(current);
-    if (!base.trim()) throw skipInjection('carrier-empty');
+    if (mode === CARRIER_SHARED) { if (base.includes(AUTO_MARKER)) throw skipInjection('carrier-auto-damaged'); }
+    else if (hasWishMarker(current)) throw skipInjection('carrier-has-wish-marker');
+    if (mode === CARRIER_SHARED ? !visibleAssistantText(base) : !base.trim()) throw skipInjection('carrier-empty');
     const fitted = fitBundleForCarrier(data, request, base, generationId);
     return { base, fitted, text: fitted.region ? fitted.message : current, skip: !fitted.region };
   }
+  const wishMarkerCount = text => (String(text ?? '').match(new RegExp(WISH_MARKER_PATTERN.source, 'gi')) || []).length;
+  // shared carrier의 PATCH 뒤 확인: 우리가 쓴 뒤 다른 도구가 같은 메시지를 또 고쳤더라도, 전에 있던 RP 블록 marker가 줄지 않았고
+  // AI가 쓴 본문이 그대로면 잃은 것이 없다.
+  const externalIntact = (before, observed) => wishMarkerCount(observed) >= wishMarkerCount(before) && visibleAssistantText(observed) === visibleAssistantText(before);
   async function injectAutoOoc(parsed, signal, socket = null, diag = {}) {
     const skip = reason => { diag.skipReason = reason; return null; };
     const data = await abortable(readLibrary(), signal);
@@ -1186,35 +1224,44 @@
     Object.assign(diag, { assistantChars: assistantText === null ? null : assistantText.length, userChars: userText.length, modelDetected: planned.modelDetected, matched: planned.matched, selected: planned.selected, omitted: planned.omitted, bundleChars: planned.chars });
     if (lookup.needed) diag.model = { source: model.source, crackerModel: model.crackerModel, chatModelId: model.chatModelId, name: model.name || model.label };
     if (!planned.block) return skip(planned.matched.length ? 'over-budget' : 'no-matching-ooc');
-    Object.assign(diag, { wrmc: { mode: wish.mode, signals: wish.signals, separate: wish.separate }, predictedWrmcCarrierId: choice.predictedWishId,
-      carrierId: choice.carrierId, carriersSeparated: !!choice.carrierId && choice.carrierId !== choice.predictedWishId, rejectedCarriers: choice.rejected });
+    Object.assign(diag, { wrmc: { mode: wish.mode, signals: wish.signals, separate: wish.separate }, predictedWrmcCarrierId: choice.predictedWishId, carrierId: choice.carrierId, carrierMode: choice.mode,
+      carriersSeparated: choice.mode === CARRIER_SEPARATE && choice.carrierId !== choice.predictedWishId, rejectedCarriers: choice.rejected });
     if (!choice.carrier) return skip('no-independent-carrier');
     const generationId = (crypto.randomUUID?.() || `${Date.now()}_${Math.random().toString(36).slice(2)}`).replace(/[^A-Za-z0-9_-]/g, '_');
-    const record = { chatId, messageId: choice.carrierId, generationId, event: parsed.event, at: Date.now(), patched: false, journaled: false, baselineLatestId: messageIdOf(frame.latest) };
+    const record = { chatId, messageId: choice.carrierId, generationId, event: parsed.event, at: Date.now(), patched: false, journaled: false, baselineLatestId: messageIdOf(frame.latest), mode: choice.mode, retries: 0 };
     diag.generationId = generationId; diagnosticsById.set(generationId, diag);
     live.set(generationId, { chatId, state: 'preparing', sentAt: 0, lastStreamAt: 0, socket });
     try {
       // H~I. PATCH 직전 최신 본문 기준으로 본문을 만들고 안전 조건을 다시 본다.
-      const result = await mutateCarrier(record, current => composeCarrier(data, request, current, generationId),
-        (observed, built) => !!built?.fitted?.region && normalizeBreaks(observed) === normalizeBreaks(built.text) && countAutoRegions(observed) === 1 && countAutoRegions(observed, generationId) === 1,
+      const result = await mutateCarrier(record, current => { diag.externalRpMarkerDetected = hasWishMarker(current); return composeCarrier(data, request, current, generationId, choice.mode); },
+        // 이번 generation의 AUTO 구간이 정확히 하나여야 한다. separate는 보낸 글 그대로여야 한다. shared는 그사이 RP Manager가 고쳤더라도
+        // 잃은 것이 없으면 되고, RP 블록이나 본문이 사라졌으면 다른 endpoint로 다시 쓰지 않고 물러난다 (자기 구간은 바로 지운다).
+        (observed, built, before) => {
+          if (!built?.fitted?.region || countAutoRegions(observed) !== 1 || countAutoRegions(observed, generationId) !== 1) return false;
+          if (normalizeBreaks(observed) === normalizeBreaks(built.text)) return true;
+          if (choice.mode !== CARRIER_SHARED || before === undefined) return false;
+          if (!externalIntact(before, observed)) throw skipInjection('carrier-external-changed', 'PATCH 뒤 RP Manager 블록 또는 본문이 달라져 물러났습니다.');
+          return true;
+        },
         signal, {
           async guard() {
             if (currentChatId() !== chatId) throw skipInjection('chat-changed');
             if (socket && socket.readyState !== 1) throw skipInjection('socket-not-open');
             const now = stableCarrierFrame(await fetchRecentMessages(chatId, signal, 30));
             const again = selectAutoCarrier(now, wish.separate || detectWish(data, now.messages).separate);
-            if (now.trailingUser || messageIdOf(now.latest) === record.messageId || again.carrierId !== record.messageId || wish.separate && again.predictedWishId === record.messageId) throw skipInjection('carrier-changed');
+            if (now.trailingUser || messageIdOf(now.latest) === record.messageId || again.carrierId !== record.messageId || again.mode !== choice.mode) throw skipInjection('carrier-changed');
           },
           // 복구 기록을 PATCH보다 먼저 남긴다. PATCH 응답을 못 받아도 잔여물 위치를 잃지 않는다.
           beforePatch() { record.journaled = true; rememberResidue(record); },
         });
+      diag.retryCount = record.retries;
       if (!result.verified) { live.delete(generationId); return skip(result.missing ? 'carrier-missing' : 'over-budget'); }
       const fitted = result.built.fitted.result;
       Object.assign(diag, { selected: fitted.selected, omitted: fitted.omitted, bundleChars: fitted.chars, patched: true, verified: true, cleanup: 'pending' });
       return record;
     } catch (error) {
       diag.skipReason = error?.reason || (error?.code === 'AUTO_OOC_ABORT' ? 'timeout' : 'patch-or-verify-failed'); diag.error = String(error?.message || error);
-      diag.patched = record.patched; diag.verified = false;
+      diag.patched = record.patched; diag.verified = false; diag.retryCount = record.retries;
       if (!record.journaled) { live.delete(generationId); return null; }
       // PATCH가 서버에 닿았을 수 있다. 원래 전송을 내보내기 전에 자기 marker부터 지워 본다.
       live.set(generationId, { chatId, state: 'armed', sentAt: 0, lastStreamAt: 0, socket });
@@ -1242,9 +1289,9 @@
       if (!turn.choice.carrier) return stop(!frame.stable.length ? 'no-stable-assistant' : turn.choice.rejected.every(row => row.reason === 'empty-body') ? 'carrier-empty' : 'no-independent-carrier');
       const message = await fetchCarrierMessage(shown.chatId, turn.choice.carrierId, signal);
       if (!message) return stop('carrier-missing');
-      const current = messageTextOf(message), made = composeCarrier(data, turn.request, current, PREVIEW_GENERATION_ID);
+      const current = messageTextOf(message), made = composeCarrier(data, turn.request, current, PREVIEW_GENERATION_ID, turn.choice.mode);
       if (made.skip) return stop('over-budget');
-      shown.carrier = { id: turn.choice.carrierId, raw: made.text, base: made.base, region: made.fitted.region, result: made.fitted.result, staleRegions: countAutoRegions(current) };
+      shown.carrier = { id: turn.choice.carrierId, mode: turn.choice.mode, external: hasWishMarker(current), raw: made.text, base: made.base, region: made.fitted.region, result: made.fitted.result, staleRegions: countAutoRegions(current) };
       return shown;
     } catch (error) {
       return error?.code === 'AUTO_OOC_SKIP' ? stop(error.reason) : stop('lookup-failed', String(error?.message || error).slice(0, 160));
@@ -1256,8 +1303,20 @@
     if (socketWatch.has(socket)) return; socketWatch.add(socket);
     socket.addEventListener('message', event => {
       const data = event.data; if (typeof data !== 'string') return;
-      // 누적 스트림 chunk는 JSON으로 풀지 않고 watchdog 기준 시각만 갱신한다.
-      if (STREAM_CHUNK_PATTERN.test(data)) { if (!live.size) return; for (const row of live.values()) if (row.socket === socket && row.state === 'armed') row.lastStreamAt = Date.now(); touchLiveResidues(); return; }
+      // 누적 스트림 chunk는 JSON으로 풀지 않는다. watchdog 기준 시각을 갱신하고, shared carrier를 뗄 때인지만 본다.
+      if (STREAM_CHUNK_PATTERN.test(data)) {
+        if (!live.size) return;
+        for (const [generationId, row] of live) {
+          if (row.socket !== socket || row.state !== 'armed') continue;
+          row.lastStreamAt = Date.now();
+          // shared carrier는 일찍 뗀다. 응답 글이 자라기 시작했다면 모델은 이미 컨텍스트를 읽은 뒤다. RP Manager 가운데에는 자기 블록 뒤에
+          // 다른 글이 있으면 블록을 못 알아보는 것이 있어서, 그 도구가 응답 완료 뒤 블록을 옮기기 전에 원래 모양으로 돌려놓는다.
+          if (!row.shared || row.released) continue;
+          row.firstChunk ??= data.length;
+          if (data.length >= row.firstChunk + SHARED_RELEASE_GROWTH) { row.released = true; scheduleCleanup('shared-stream-started', item => item.generationId === generationId); }
+        }
+        touchLiveResidues(); return;
+      }
       if (!live.size && !COMPLETED_FRAME_PATTERN.test(data)) return;
       const parsed = parseSocketFrame(data); if (!parsed) return;
       const reason = parsed.event === 'characterMessageGenerated' ? 'generation-completed' : /cancel/i.test(parsed.event) ? 'generation-cancelled' : /(?:error|failed)/i.test(parsed.event) ? 'generation-error' : '';
@@ -1329,7 +1388,7 @@
     Object.defineProperty(W, '__CRACK_OOC_LIBRARY_TEST_API__', { configurable: true, value: {
       check, transport, selectAutoOoc: (data, request) => selectAutoOoc(check(data), request), stableCarrierFrame, selectAutoCarrier, detectWish, removeAutoRegions, countAutoRegions, autoRegion, autoRegionOverhead,
       conditionSourceText, cleanupAutoRecord, cleanupChatResidues, injectAutoOoc, markerPattern, fitBundleForCarrier, loadResidues, diagnostics: autoDiagnostics, hookInfo, live,
-      composeCarrier, previewTurn: (data, api) => previewTurn(check(data), api), PREVIEW_GENERATION_ID,
+      composeCarrier, previewTurn: (data, api) => previewTurn(check(data), api), PREVIEW_GENERATION_ID, fresh, normalizeAuto, normalizeSettings, readLibrary,
       modelOptions, legacyModelKey, refreshModelCatalog, currentModelContext, visibleAssistantText,
       parseFirebaseAppConfig, normalizeSituationSettings, saveSituationSettings, judgeSituations, parseMatchedIds, pendingSituations: (data, request) => pendingSituations(check(data), request),
       testSituationApi, situationPrompt, diagnosticsText, SITUATION_MODELS, SITUATION_CONTEXT_MESSAGES, SITUATION_TIMEOUT_MS,
@@ -1553,9 +1612,10 @@
     'no-matching-ooc': '지금 조건에 맞는 OOC가 없습니다.',
     'over-budget': '조건에 맞는 OOC가 있지만 최대 글자수 안에 하나도 들어가지 않습니다.',
     'no-stable-assistant': '붙일 수 있는 과거 AI 답변이 아직 없습니다. 최신 AI 답변과 그 앞의 USER 입력보다 오래된 AI 답변이 있어야 합니다.',
-    'no-independent-carrier': 'Wish RP Manager가 쓰는 답변과 겹치지 않는 과거 AI 답변이 없습니다.',
+    'no-independent-carrier': '독립된 과거 AI 답변이 없고, RP Manager와 함께 쓸 수 있는 과거 AI 답변도 없습니다.',
     'carrier-empty': '붙일 과거 AI 답변의 본문이 비어 있습니다.',
-    'carrier-has-wish-marker': '붙일 과거 AI 답변을 Wish RP Manager가 이미 쓰고 있습니다.',
+    'carrier-has-wish-marker': '고른 과거 AI 답변을 방금 RP Manager가 쓰기 시작했습니다. 미리보기를 다시 눌러 주세요.',
+    'carrier-auto-damaged': '붙일 과거 AI 답변에 짝이 맞지 않는 AUTO marker가 남아 있어 건드리지 않습니다.',
     'carrier-missing': '붙일 과거 AI 답변을 서버에서 찾지 못했습니다.',
     'lookup-failed': '대화를 조회하지 못했습니다.',
   };
@@ -1584,8 +1644,9 @@
       if (uses('model')) line(turn.planned.modelDetected ? `현재 모델: ${model?.name || model?.label || model?.crackerModel || '확인됨'}` : '현재 모델을 확인하지 못해 모델 조건 OOC는 빠집니다.');
     }
     if (shown.carrier) {
-      const { id, raw, base, region, staleRegions } = shown.carrier, details = node('details', 'oa-raw'), copied = node('span', 'oa-muted', ''), buttons = node('div', 'oa-button-row');
-      line(`주입 대상: ${id !== turn.choice.predictedWishId ? 'WRMC와 분리된 과거 AI 답변' : '최신 직전의 과거 AI 답변'} (메시지 ${id})`);
+      const { id, mode, external, raw, base, region, staleRegions } = shown.carrier, details = node('details', 'oa-raw'), copied = node('span', 'oa-muted', ''), buttons = node('div', 'oa-button-row');
+      line(`주입 대상: ${mode === CARRIER_SHARED ? '독립 carrier가 없어 RP Manager와 같은 과거 AI 답변을 사용합니다. 기존 RP 컨텍스트 뒤에 AUTO OOC를 추가합니다.' : '별도 과거 AI 답변에 AUTO OOC를 주입합니다.'} (메시지 ${id})`);
+      if (mode === CARRIER_SHARED) line(external ? '아래 본문의 RP Manager 블록은 지금 서버에 있는 그대로이며 고치지 않습니다. 응답이 나오기 시작하면 AUTO 구간만 다시 뗍니다.' : '이 답변은 RP Manager가 이번 턴에 쓸 것으로 예상되는 자리입니다. 지금은 RP 블록이 없어 본문 뒤에 바로 붙습니다.');
       const box = rawBox('전체 메시지 미리보기', raw, 14);
       buttons.append(action('복사', async () => { await copyText(raw, box); copied.textContent = '복사했습니다.'; }), copied);
       details.append(node('summary', '', '전체 메시지 미리보기'),
@@ -1603,7 +1664,7 @@
   }
   function showSettings() {
     const view = dialog('설정'); const data = editing || library, autoHeading = node('h3', '', '자동 OOC');
-    const autoArea = node('section', 'oa-settings-section'), enabled = toggleField(autoArea, '자동 OOC 사용', data.autoSettings.autoInjectionEnabled, 'USER 입력문은 건드리지 않습니다. 과거 AI 답변 하나에 응답이 끝날 때까지만 숨김 주석으로 붙였다가 제거합니다. 독립된 답변을 확보하지 못한 턴은 자동 OOC만 건너뜁니다.');
+    const autoArea = node('section', 'oa-settings-section'), enabled = toggleField(autoArea, '자동 OOC 사용', data.autoSettings.autoInjectionEnabled, 'USER 입력문은 건드리지 않습니다. 과거 AI 답변 하나에 응답이 끝날 때까지만 숨김 주석으로 붙였다가 제거합니다. 독립된 답변이 없으면 RP Manager가 쓰는 답변 끝에 함께 붙이고, 그것도 안전하지 않은 턴은 자동 OOC만 건너뜁니다.');
     const maxChars = field(autoArea, '자동 OOC 최대 글자수 (USER 2,000자와 별개 · marker/구분자 포함)', 'input', String(data.autoSettings.autoOocMaxChars)); maxChars.type = 'number'; maxChars.min = '0'; maxChars.max = '50000'; maxChars.step = '100';
     const wrmcMode = field(autoArea, 'Wish RP Manager와 주입 대상 분리', 'select');
     for (const [value, label] of [['auto', '자동 감지 (권장)'], ['always', '항상 분리'], ['never', '분리 안 함 (WRMC 미사용)']]) wrmcMode.append(new Option(label, value));
