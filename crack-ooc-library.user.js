@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Crack OOC 보관함
 // @namespace    crack.ooc.library
-// @version      2.0.2.0
+// @version      2.0.3.1
 // @description  OOC를 보관하고 안전한 assistant carrier에 독립적으로 자동 컨텍스트를 주입 (version 관리방식: 데이터구조버전.크랙UI변경.기능추가및수정.버그수정)
 // @match        https://crack.wrtn.ai/*
 // @noframes
@@ -21,6 +21,11 @@
  * - 구버전 호환: 1.x 스크립트는 schemaVersion 2 자료를 "데이터 형식이 올바르지 않습니다"로 거부한다.
  *   같은 Firebase/백업을 쓰는 다른 기기도 2.x로 올려야 읽을 수 있다 (조용한 자료 손실은 없다).
  * - autoSettings.wrmcCarrierMode는 2.0.2.0에서 추가됐다. 2.0.1.x가 저장하면 이 값만 빠지고 'auto'로 돌아간다.
+ *
+ * - 2.0.3.0: autoInjection.priority / injectionBody를 없앴다 (읽을 때 무시, 다음 저장 때 빠짐). 자동주입은 항상 content를 쓰고,
+ *   우선순위는 보관함 표시 순서다. 기존 priority 값으로 순서를 바꾸지 않는다. 내용이 비어 있고 주입용 본문만 있던 항목은
+ *   그 글을 content로 옮긴다. 모델 조건은 autoInjection.modelKey(crackerModel)/modelName으로 저장하며, 예전에 직접 입력한
+ *   모델 문자열(conditionValue)은 그대로 두고 계속 비교에 쓴다. 2.0.2.x가 이 자료를 저장하면 modelKey/modelName이 빠진다.
  *
  * 자동 OOC (2.0.2.0)
  * - USER 메시지와 WebSocket payload는 읽기만 한다. 자동 OOC는 과거 assistant 메시지(carrier) 끝에
@@ -52,7 +57,12 @@
   const WRMC_MODES = ['auto', 'always', 'never'];
   const RESIDUE_KEY = 'crack-ooc-library.auto-residues.v1';
   const CONDITION_TYPES = new Set(['always', 'model', 'userLength', 'keyword']);
-  const AUTO_DEFAULTS = Object.freeze({ enabled: false, conditionType: 'always', conditionValue: '', keywordScope: 'user', priority: 0, injectionBody: '' });
+  const MODEL_CACHE_KEY = 'crack-ooc-library.chat-models.v1';
+  const MODEL_CACHE_MAX_AGE_MS = 6 * 60 * 60 * 1000;
+  // Crack chat-models API가 받는 serviceType 값과 dropdown 묶음 이름.
+  const MODEL_SERVICES = [['story', '스토리'], ['character', '캐릭터'], ['partyChat', '파티챗']];
+  const LEGACY_MODEL_OPTION = '__legacy__';
+  const AUTO_DEFAULTS = Object.freeze({ enabled: false, conditionType: 'always', conditionValue: '', keywordScope: 'user', modelKey: '', modelName: '' });
   const SETTINGS_DEFAULTS = Object.freeze({ autoInjectionEnabled: false, autoOocMaxChars: 2000, wrmcCarrierMode: 'auto' });
   const fresh = () => ({ schemaVersion: SCHEMA_VERSION, updatedAt: 0, autoSettings: { ...SETTINGS_DEFAULTS }, categories: [], extras: [] });
   const copy = value => JSON.parse(JSON.stringify(value));
@@ -60,7 +70,7 @@
   let library = null, editing = null, pendingRead = null, database = null, saving = false;
   let settings = { mode: 'local' }, manager = null, selectedInput = null, drag = null;
   const expanded = new Set(), attached = new Map();
-  const socketWatch = new WeakSet(), sendQueues = new Map(), inFlight = new Set();
+  const socketWatch = new WeakSet(), sendQueues = new Map();
   // generationId → { chatId, state: 'preparing' | 'armed', sentAt, lastStreamAt, socket }
   const live = new Map(), carrierLocks = new Map(), cleanupRunning = new Map();
   const autoDiagnostics = [], diagnosticsById = new Map();
@@ -84,14 +94,17 @@
   function normalizeAuto(value = {}) {
     const src = value && typeof value === 'object' && !Array.isArray(value) ? value : {};
     const conditionType = CONDITION_TYPES.has(src.conditionType) ? src.conditionType : AUTO_DEFAULTS.conditionType;
-    const priority = Number(src.priority);
+    // 2.0.3.0: priority와 injectionBody는 읽을 때 무시하고 저장할 때 빠진다. 우선순위는 보관함 표시 순서다.
+    // modelKey는 Crack chat-models의 crackerModel 값, modelName은 그때의 표시명이다.
+    // modelKey가 없는 모델 조건의 conditionValue는 2.0.2.x에서 직접 입력한 문자열이며 그대로 보존한다.
+    const modelKey = conditionType === 'model' && typeof src.modelKey === 'string' ? src.modelKey.trim().slice(0, 200) : '';
     return {
       enabled: src.enabled === true,
       conditionType,
       conditionValue: String(src.conditionValue || '').slice(0, 1000),
       keywordScope: ['user', 'recent', 'both'].includes(src.keywordScope) ? src.keywordScope : 'user',
-      priority: Number.isFinite(priority) ? Math.max(-999, Math.min(999, Math.trunc(priority))) : 0,
-      injectionBody: typeof src.injectionBody === 'string' ? src.injectionBody : '',
+      modelKey,
+      modelName: modelKey && typeof src.modelName === 'string' ? src.modelName.trim().slice(0, 200) : '',
     };
   }
   function normalizeSettings(value = {}) {
@@ -108,7 +121,10 @@
     let id = typeof value.id === 'string' && /^[\w-]{1,100}$/.test(value.id) ? value.id : stableId(`${path}\u0000${name}\u0000${value.content}`);
     if (usedIds.has(id)) id = stableId(`${id}\u0000${path}`);
     usedIds.add(id);
-    return { id, name, content: value.content, autoInjection: normalizeAuto(value.autoInjection) };
+    // 예전 "주입용 본문"은 더 쓰지 않는다. 단, 내용이 비어 있고 주입용 본문만 있던 항목은 그 글이 사라지지 않게 내용으로 옮긴다.
+    const legacyBody = value.autoInjection?.injectionBody;
+    const content = !value.content.trim() && typeof legacyBody === 'string' && legacyBody.trim() ? legacyBody : value.content;
+    return { id, name, content, autoInjection: normalizeAuto(value.autoInjection) };
   }
   function migrateV1(value) {
     const used = new Set();
@@ -324,15 +340,89 @@
     return null;
   }
   function splitValues(value) { return String(value || '').split(/[\n,]+/).map(part => part.normalize('NFKC').trim()).filter(Boolean); }
+  const modelText = value => String(value ?? '').normalize('NFKC').trim().toLocaleLowerCase();
+
+  // Crack 모델 목록. GET crack-gen/v3/chat-models?serviceType=… 의 실제 응답만 쓴다 (이름을 스크립트에 적어 두지 않는다).
+  // 한 행: { id: _id, name: 표시명, key: crackerModel, service, retired }. 같은 key가 가격·버전별로 여러 _id를 가진다.
+  let modelCatalog = [], modelCatalogAt = 0, modelCatalogLoading = null, modelCatalogFetchedAt = 0, modelCatalogForcedAt = 0;
+  const catalogRow = row => row && typeof row.id === 'string' && typeof row.name === 'string' && typeof row.key === 'string' && row.id && row.name && row.key;
+  try {
+    const cached = JSON.parse(pageStorage.getItem(MODEL_CACHE_KEY) || 'null');
+    if (Array.isArray(cached?.rows)) { modelCatalog = cached.rows.filter(catalogRow); modelCatalogAt = Number(cached.at) || 0; }
+  } catch { /* 캐시가 없으면 필요할 때 불러온다. */ }
+  function catalogRows(models, service) {
+    return (Array.isArray(models) ? models : []).map(model => ({ id: String(model?._id || ''), name: String(model?.name || '').trim(), key: String(model?.crackerModel || '').trim(), service, retired: !!model?.deletedAt || model?.isBlock === true })).filter(catalogRow);
+  }
+  function refreshModelCatalog(signal, force = false) {
+    if (!force && modelCatalog.length && Date.now() - modelCatalogAt < MODEL_CACHE_MAX_AGE_MS) return Promise.resolve(modelCatalog);
+    if (!modelCatalogLoading) modelCatalogLoading = (async () => {
+      const lists = await Promise.all(MODEL_SERVICES.map(([service]) => crackRequest('GET', `https://crack-api.wrtn.ai/crack-gen/v3/chat-models?serviceType=${service}`, undefined, signal)
+        .then(response => catalogRows(response?.data?.models ?? response?.models, service), () => null)));
+      const failed = MODEL_SERVICES.filter((_, index) => lists[index] === null).map(([service]) => service), rows = lists.flatMap(list => list || []);
+      if (rows.length) {
+        // 일부 묶음만 실패했으면 그 묶음은 예전 목록을 유지하고 다음에 다시 시도한다.
+        modelCatalog = [...rows, ...modelCatalog.filter(row => failed.includes(row.service))]; modelCatalogAt = failed.length ? 0 : Date.now(); modelCatalogFetchedAt = Date.now();
+        try { pageStorage.setItem(MODEL_CACHE_KEY, JSON.stringify({ at: modelCatalogAt, rows: modelCatalog })); } catch {}
+      }
+      return modelCatalog;
+    })().finally(() => { modelCatalogLoading = null; });
+    return modelCatalogLoading;
+  }
+  // Crack은 가격·버전이 바뀌면 같은 모델에 새 _id를 준다. 방의 chatModelId가 캐시된 목록에 없으면 목록을 한 번 새로 받는다
+  // (이 페이지에서 방금 받았거나 10분 안에 이미 다시 받아 봤으면 생략).
+  async function ensureRoomModelKnown(room, signal) {
+    const id = room?.chatModelId, now = Date.now();
+    if (!id || modelCatalog.some(row => row.id === id) || now - modelCatalogFetchedAt < 60000 || now - modelCatalogForcedAt < 600000) return;
+    modelCatalogForcedAt = now;
+    await refreshModelCatalog(signal, true).catch(() => []);
+  }
+  // dropdown용: key가 같은 행을 하나로 합친다 (다른 묶음에 같은 모델이 또 나와도 처음 나온 묶음에만 둔다).
+  // 판매 종료된 행만 남은 모델은 retired다.
+  function modelGroups() {
+    const byKey = new Map();
+    return MODEL_SERVICES.map(([service, label]) => {
+      const options = [];
+      for (const row of modelCatalog.filter(item => item.service === service)) {
+        const known = byKey.get(row.key);
+        if (!known) { const option = { key: row.key, name: row.name, retired: row.retired }; byKey.set(row.key, option); options.push(option); }
+        else if (known.retired && !row.retired) { known.name = row.name; known.retired = false; }
+      }
+      return { service, label, options };
+    }).filter(group => group.options.length);
+  }
+  // 2.0.2.x에서 직접 입력한 모델 문자열 하나가 현재 목록의 모델과 정확히 맞으면 그 key를 돌려준다.
+  function legacyModelKey(value) {
+    const wanted = splitValues(value).map(modelText), squash = text => modelText(text).replace(/\s+/g, '');
+    if (wanted.length !== 1) return '';
+    return modelCatalog.find(row => [row.key, row.name, row.id].some(item => squash(item) === squash(wanted[0])))?.key || '';
+  }
+  // 방의 chatModelId(_id)나 crackerModel만 알아도 목록으로 나머지 식별값을 채운다.
+  function resolveModel(context) {
+    const out = { crackerModel: '', chatModelId: '', model: '', label: '', name: '', source: '', ...(context && typeof context === 'object' ? context : {}) };
+    const byId = out.chatModelId && modelCatalog.find(row => row.id === String(out.chatModelId));
+    if (byId) { if (!out.crackerModel) out.crackerModel = byId.key; if (!out.name) out.name = byId.name; }
+    const byKey = out.crackerModel && modelCatalog.find(row => modelText(row.key) === modelText(out.crackerModel));
+    if (byKey && !out.name) out.name = byKey.name;
+    return out;
+  }
   function modelValues(model) {
     const source = model && typeof model === 'object' ? model : {};
-    return [...new Set([source.crackerModel, source.chatModelId, source.model, source.label, source.name].map(value => String(value || '').normalize('NFKC').trim().toLocaleLowerCase()).filter(Boolean))];
+    return [...new Set([source.crackerModel, source.chatModelId, source.model, source.label, source.name].map(modelText).filter(Boolean))];
+  }
+  function catalogKnows(model) {
+    const values = modelValues(model);
+    return modelCatalog.some(row => [row.id, row.key, row.name].some(item => values.includes(modelText(item))));
+  }
+  function ruleModelValues(rule) {
+    const key = modelText(rule.modelKey), rows = modelCatalog.filter(row => modelText(row.key) === key);
+    return [...new Set([key, modelText(rule.modelName), ...rows.flatMap(row => [modelText(row.id), modelText(row.name)])].filter(Boolean))];
   }
   function conditionMatches(entry, request) {
     const rule = entry.autoInjection, value = rule.conditionValue;
     if (rule.conditionType === 'always') return true;
     if (rule.conditionType === 'model') {
-      const actual = modelValues(request.model), wanted = splitValues(value).map(item => item.toLocaleLowerCase());
+      // 모델을 확인하지 못한 턴에는 actual이 비어 모델 조건 OOC만 빠진다.
+      const actual = modelValues(request.model), wanted = rule.modelKey ? ruleModelValues(rule) : splitValues(value).map(modelText);
       return wanted.length > 0 && wanted.some(item => actual.includes(item));
     }
     if (rule.conditionType === 'userLength') {
@@ -348,31 +438,33 @@
     }
     return false;
   }
+  // 자동주입에도 수동 삽입과 같은 content를 그대로 쓴다.
   function renderAutoItem(entry) {
-    const body = String(entry.autoInjection.injectionBody || entry.content || '').trim();
+    const body = String(entry.content || '').trim();
     if (!body) return '';
     return `- ${safeForHtmlComment(body.replace(/\r\n?/g, '\n')).replace(/\n/g, '\n  ')}`;
   }
   // maxChars는 USER 2,000자와 무관한 AUTO 전용 예산이다. carrier에 실제로 덧붙는 전체 구간
   // (marker 주석, [자동 OOC] wrapper, 항목 구분자)을 모두 센다. 항목은 통째로 넣거나 통째로 뺀다.
+  // 우선순위는 보관함 표시 순서다: 위 카테고리부터, 카테고리 안에서는 위 항목부터, 미분류는 화면처럼 마지막.
   function selectAutoOoc(data, request = {}) {
     const configured = normalizeSettings(data.autoSettings), requested = Number(request.maxChars);
     const maxChars = Math.max(0, Math.min(configured.autoOocMaxChars, Number.isFinite(requested) ? Math.trunc(requested) : configured.autoOocMaxChars));
     const overhead = Number.isFinite(Number(request.overhead)) ? Math.max(0, Number(request.overhead)) : autoRegionOverhead();
     const modelDetected = modelValues(request.model).length > 0;
-    if (!configured.autoInjectionEnabled || !['before-send', 'before-reroll', 'preview'].includes(request.reason) || maxChars <= 0) return { block: '', selected: [], matched: [], omitted: 0, maxChars, chars: 0, modelDetected };
-    const seen = new Set(), summary = row => ({ id: row.entry.id, name: row.entry.name, priority: row.entry.autoInjection.priority });
+    if (!configured.autoInjectionEnabled || !['before-send', 'before-reroll', 'preview'].includes(request.reason) || maxChars <= 0) return { block: '', selected: [], matched: [], omitted: [], maxChars, chars: 0, modelDetected };
+    const seen = new Set(), omitted = [], summary = row => ({ id: row.entry.id, name: row.entry.name, libraryOrder: row.order + 1 });
     const candidates = allEntries(data).map((entry, order) => ({ entry, order, rendered: renderAutoItem(entry) }))
       .filter(row => row.entry.autoInjection.enabled && row.rendered && conditionMatches(row.entry, request))
-      .filter(row => { const key = row.rendered.normalize('NFKC'); if (seen.has(key)) return false; seen.add(key); return true; })
-      .sort((a, b) => b.entry.autoInjection.priority - a.entry.autoInjection.priority || a.order - b.order);
+      .filter(row => { const key = row.rendered.normalize('NFKC'); if (seen.has(key)) { omitted.push({ ...summary(row), reason: 'duplicate-content' }); return false; } seen.add(key); return true; });
     const selected = [], pieces = [], prefix = '[자동 OOC]\n', suffix = '\n[/자동 OOC]';
     for (const row of candidates) {
       const next = [...pieces, row.rendered], block = prefix + next.join('\n') + suffix;
       if (block.length + overhead <= maxChars) { pieces.push(row.rendered); selected.push(summary(row)); }
+      else omitted.push({ ...summary(row), reason: 'over-budget' });
     }
     const block = pieces.length ? prefix + pieces.join('\n') + suffix : '';
-    return { block, selected, matched: candidates.map(summary), omitted: candidates.length - selected.length, maxChars, chars: block ? block.length + overhead : 0, modelDetected };
+    return { block, selected, matched: candidates.map(summary), omitted, maxChars, chars: block ? block.length + overhead : 0, modelDetected };
   }
 
   // ---------------------------------------------------------------------------
@@ -389,9 +481,16 @@
       return Array.isArray(value) && typeof value[0] === 'string' ? { event: value[0], payload: value[1], ackId: match[2], raw } : null;
     } catch { return null; }
   }
-  const messageIdOf = message => String(message?._id || message?.id || '');
-  const messageRoleOf = message => String(message?.role || message?.type || '').toLowerCase();
-  const messageTextOf = message => String(message?.content ?? message?.message ?? message?.text ?? '');
+  // 메시지 id·역할·본문은 WRMC와 같은 규칙으로 읽는다. 다르게 읽으면 WRMC carrier 예측이 어긋날 수 있다.
+  const messageIdOf = message => String(message?._id || message?.id || message?.messageId || '');
+  const messageRoleOf = message => String(message?.role || message?.speaker || '').toLowerCase();
+  function messageTextOf(message) {
+    if (!message) return '';
+    // 비어 있는 content가 실제 본문(message)을 가리지 않게 한다.
+    if (typeof message.content === 'string' && message.content.trim()) return message.content;
+    if (typeof message.message === 'string' && message.message.trim()) return message.message;
+    return typeof message.content === 'string' ? message.content : typeof message.message === 'string' ? message.message : '';
+  }
   function currentChatId(pathname = W.location?.pathname || location.pathname) {
     for (const pattern of [/^\/stories\/[^/]+\/episodes\/([^/?#]+)/, /^\/characters\/[^/]+\/chats\/([^/?#]+)/, /^\/u\/[^/]+\/c\/([^/?#]+)/]) {
       const match = String(pathname).match(pattern); if (match) return match[1];
@@ -525,7 +624,7 @@
       if (message.length <= PATCH_CHAR_LIMIT && carrierBytes(message) <= PATCH_BYTE_BUDGET) return { result, region, message };
       limit = Math.min(limit - 1, result.chars - 1);
     }
-    return { result: { block: '', selected: [], matched: [], omitted: 0, chars: 0 }, region: '', message: base };
+    return { result: { block: '', selected: [], matched: [], omitted: [], chars: 0 }, region: '', message: base };
   }
   const LORE_TAG_PATTERN = /\s*<ooc_lore_context>[\s\S]*?<\/ooc_lore_context>\s*/gi, LORE_TAG_ESCAPED_PATTERN = /\s*&lt;ooc_lore_context&gt;[\s\S]*?&lt;\/ooc_lore_context&gt;\s*/gi;
   const WISH_BLOCK_PATTERN = /(?:\\|\?)?(?:<!--|&lt;!--)RP_CONTEXT_MANAGER_START\b[\s\S]*?RP_CONTEXT_MANAGER_END(?:-->|--&gt;)/gi;
@@ -542,24 +641,45 @@
     const button = [...document.querySelectorAll('button[aria-haspopup]')].find(node => node.querySelector('img[src*="/model-icon/"]'));
     return String(button?.textContent || '').trim();
   }
-  function currentModelContext(payload, messages = []) {
-    // 메시지 객체의 crackerModel/chatModelId/model은 직전 assistant 응답에 쓰인 모델이다. 아무 곳에서도 못 찾으면 빈 값이 되고 모델 조건 OOC만 빠진다.
-    const lastAssistant = (messages || []).find(message => messageRoleOf(message) === 'assistant');
-    const sources = [payload, payload?.data, payload?.options, payload?.data?.options, lastAssistant].filter(value => value && typeof value === 'object');
-    const pick = (...keys) => { for (const source of sources) for (const key of keys) if (typeof source[key] === 'string' && source[key].trim()) return source[key].trim(); return ''; };
-    let next = {};
-    try {
-      const script = document.querySelector('#__NEXT_DATA__'), state = script ? JSON.parse(script.textContent || '{}') : null;
-      const chatId = String(payload?.chatId || payload?.data?.chatId || currentChatId());
-      const fallback = state?.props?.pageProps?.fallback || {};
-      next = fallback[`/v3/chats/${chatId}`]?.data || Object.values(fallback).find(value => String(value?.data?._id || value?.data?.id || '') === chatId)?.data || {};
-    } catch {}
-    return {
-      crackerModel: pick('crackerModel', 'cracker_model') || String(next?.crackerModel || ''),
-      chatModelId: pick('chatModelId', 'chat_model_id') || String(next?.chatModelId || ''),
-      model: pick('model', 'modelId', 'model_id', 'engine') || String(next?.model || ''),
-      label: pick('modelName', 'modelLabel', 'crackerModelName') || semanticModelLabel(),
+  // 방 정보의 chatModelId가 다음 generation에 쓰일 모델이다 (Crack은 모델을 바꿀 때 이 값을 PATCH한다).
+  async function fetchRoomModel(chatId, signal) {
+    const response = await crackRequest('GET', `https://crack-api.wrtn.ai/crack-gen/v3/chats/${encodeURIComponent(chatId)}`, undefined, signal);
+    const room = response?.data || response || {}, text = value => typeof value === 'string' ? value.trim() : '';
+    return { crackerModel: text(room.crackerModel), chatModelId: text(room.chatModelId), model: text(room.model) };
+  }
+  // 한 출처만 쓴다. 여러 출처를 섞으면 모델을 바꾼 직후 예전 모델 조건까지 맞아 버린다.
+  // 전송 payload → 방 정보 → 화면의 모델 버튼 → 직전 AI 답변 → 페이지 로드 때의 metadata 순서이며,
+  // 아무 곳에서도 못 찾으면 빈 값이 되어 모델 조건 OOC만 빠진다.
+  function currentModelContext(payload, messages = [], room = null) {
+    const fields = source => {
+      const pick = (...keys) => { for (const key of keys) if (typeof source?.[key] === 'string' && source[key].trim()) return source[key].trim(); return ''; };
+      return { crackerModel: pick('crackerModel', 'cracker_model'), chatModelId: pick('chatModelId', 'chat_model_id'), model: pick('model', 'modelId', 'model_id', 'engine'), label: pick('modelName', 'modelLabel', 'crackerModelName') };
     };
+    const merged = (...sources) => sources.map(fields).reduce((out, row) => { for (const key of Object.keys(row)) if (!out[key]) out[key] = row[key]; return out; }, fields(null));
+    const known = context => Object.values(context).some(Boolean);
+    const tiers = [
+      ['payload', () => merged(payload, payload?.data, payload?.options, payload?.data?.options)],
+      ['room', () => fields(room)],
+      ['model-button', () => ({ ...fields(null), label: semanticModelLabel() })],
+      ['last-assistant', () => fields((messages || []).find(message => messageRoleOf(message) === 'assistant'))],
+      ['page-metadata', () => {
+        const script = document.querySelector('#__NEXT_DATA__'), state = script ? JSON.parse(script.textContent || '{}') : null;
+        const chatId = String(payload?.chatId || payload?.data?.chatId || currentChatId()), fallback = state?.props?.pageProps?.fallback || {};
+        return fields(fallback[`/v3/chats/${chatId}`]?.data || Object.values(fallback).find(value => String(value?.data?._id || value?.data?.id || '') === chatId)?.data);
+      }],
+    ];
+    // 값이 있더라도 Crack 모델 목록에서 확인되지 않는 출처(뜻 모를 payload 필드, 가격이 함께 적힌 버튼 글자 등)가
+    // 확인되는 출처를 가리지 않게 한다. 확인되는 출처가 하나도 없으면 값이 있는 첫 출처를 쓴다.
+    let unconfirmed = null;
+    for (const [source, read] of tiers) {
+      try {
+        const context = read(); if (!known(context)) continue;
+        const resolved = resolveModel({ ...context, source });
+        if (catalogKnows(resolved)) return resolved;
+        if (!unconfirmed) unconfirmed = resolved;
+      } catch { /* 다음 출처로 넘어간다. */ }
+    }
+    return unconfirmed || resolveModel(null);
   }
   // 복구 기록은 "어느 방의 어느 메시지에 어떤 generation marker가 남았을 수 있는지"만 담는다.
   // 본문 snapshot은 저장하지 않으며, cleanup은 항상 서버의 현재 본문에서 자기 marker 구간만 지운다.
@@ -579,6 +699,15 @@
   }
   function forgetResidue(generationId) { saveResidues(loadResidues().filter(row => row.generationId !== generationId)); }
   const skipInjection = (reason, message = reason) => Object.assign(Error(message), { code: 'AUTO_OOC_SKIP', reason });
+  // signal이 abort되면 기다리기를 그만둔다. 자료 읽기나 메시지 잠금 대기가 원래 전송을 제한 시간 넘게 붙잡지 못하게 한다.
+  function abortable(promise, signal) {
+    const pending = Promise.resolve(promise); if (!signal) return pending;
+    return new Promise((resolve, reject) => {
+      const abort = () => reject(Object.assign(Error('자동 OOC 준비가 제한 시간을 넘었습니다.'), { code: 'AUTO_OOC_ABORT' }));
+      pending.then(resolve, reject).finally(() => signal.removeEventListener('abort', abort));
+      if (signal.aborted) abort(); else signal.addEventListener('abort', abort, { once: true });
+    });
+  }
   // 이 스크립트가 같은 메시지를 읽고-고쳐-쓰는 작업(주입·cleanup)을 메시지 단위로 직렬화한다.
   function withCarrierLock(record, work) {
     const key = `${record.chatId}:${record.messageId}`, previous = carrierLocks.get(key) || Promise.resolve();
@@ -587,7 +716,7 @@
     return task.finally(() => { if (carrierLocks.get(key) === task) carrierLocks.delete(key); });
   }
   function mutateCarrier(record, build, verify, signal, hooks = {}) {
-    return withCarrierLock(record, async () => {
+    return abortable(withCarrierLock(record, async () => {
       const endpoints = patchEndpoints(record.chatId, record.messageId); let lastError = null;
       for (let round = 0; round < endpoints.length; round++) {
         if (signal?.aborted) throw Object.assign(Error('자동 OOC 처리가 취소되었습니다.'), { code: 'AUTO_OOC_ABORT' });
@@ -614,7 +743,7 @@
         }
       }
       throw lastError || Error('AUTO OOC carrier PATCH에 실패했습니다.');
-    });
+    }), signal);
   }
   function noteCleanup(generationId, ok, reason) {
     const diag = diagnosticsById.get(generationId); if (!diag) return;
@@ -637,7 +766,16 @@
   // 준비 중(아직 원래 전송을 내보내지 않은) generation의 block은 어떤 trigger도 지우지 않는다.
   const cleanable = row => live.get(row.generationId)?.state !== 'preparing';
   // 이 페이지가 만든 기록이 아니면 다른 탭이 방금 준비한 generation일 수 있다. 충분히 지난 것만 잔여물로 본다.
-  const staleEnough = row => !live.has(row.generationId) && Date.now() - Number(row.at || 0) >= LOAD_RECOVERY_MIN_AGE_MS;
+  const lastSeen = row => Math.max(Number(row.at) || 0, Number(row.seen) || 0);
+  const staleEnough = row => !live.has(row.generationId) && Date.now() - lastSeen(row) >= LOAD_RECOVERY_MIN_AGE_MS;
+  // 스트림이 오는 동안 5초에 한 번 기록에 흔적을 남겨, 다른 탭이 진행 중인 generation을 잔여물로 보지 않게 한다.
+  let residueHeartbeatAt = 0;
+  function touchLiveResidues() {
+    const now = Date.now(); if (now - residueHeartbeatAt < 5000) return; residueHeartbeatAt = now;
+    const rows = loadResidues(); let changed = false;
+    for (const row of rows) if (live.get(row.generationId)?.state === 'armed') { row.seen = now; changed = true; }
+    if (changed) saveResidues(rows);
+  }
   async function cleanupChatResidues(chatId, signal, reason = 'residue') {
     const outcome = { ok: true, cleaned: [] };
     for (const record of loadResidues().filter(row => String(row.chatId) === String(chatId) && cleanable(row))) {
@@ -677,7 +815,7 @@
   }
   function armGeneration(record, socket) {
     const generationId = record.generationId;
-    live.set(generationId, { chatId: record.chatId, state: 'armed', sentAt: Date.now(), lastStreamAt: 0, socket });
+    live.set(generationId, { chatId: record.chatId, state: 'armed', sentAt: Date.now(), lastStreamAt: 0, socket, baselineLatestId: record.baselineLatestId });
     // 완료·오류 이벤트를 받지 못한 generation은 마지막 스트림 활동 뒤 120초에 정리한다.
     const tick = () => {
       const row = live.get(generationId); if (!row) return;
@@ -697,13 +835,19 @@
   }
   async function injectAutoOoc(parsed, signal, socket = null, diag = {}) {
     const skip = reason => { diag.skipReason = reason; return null; };
-    const data = await readLibrary();
+    const data = await abortable(readLibrary(), signal);
     if (!data.autoSettings.autoInjectionEnabled || !allEntries(data).some(entry => entry.autoInjection.enabled)) return skip('auto-ooc-off');
     const chatId = String(parsed.payload?.chatId || parsed.payload?.data?.chatId || ''); if (!chatId) return skip('no-chat-id');
-    // 방금 내보낸 generation이 아직 컨텍스트를 읽기 전일 수 있다. 그 block은 건드리지 않고 이번 frame만 그대로 보낸다.
-    if ([...live.values()].some(row => row.chatId === chatId && row.state === 'armed' && !row.ended && Date.now() - row.sentAt < IN_PROGRESS_GRACE_MS)) return skip('generation-in-progress');
+    const justSent = [...live.values()].filter(row => row.chatId === chatId && row.state === 'armed' && !row.ended && Date.now() - row.sentAt < IN_PROGRESS_GRACE_MS);
+    // 모델 조건 OOC가 켜져 있을 때만 방의 현재 모델을 읽는다. 최근 대화 조회와 함께 보내고, 실패하면 다른 출처로 판별한다.
+    const needsModel = allEntries(data).some(entry => entry.autoInjection.enabled && entry.autoInjection.conditionType === 'model');
+    const roomModel = needsModel ? fetchRoomModel(chatId, signal).catch(() => null) : Promise.resolve(null);
+    const catalogReady = !needsModel ? Promise.resolve() : modelCatalog.length ? (void refreshModelCatalog().catch(() => {}), Promise.resolve()) : refreshModelCatalog(signal).catch(() => {});
     let recent = await fetchRecentMessages(chatId, signal, 50), frame = stableCarrierFrame(recent);
     if (frame.trailingUser) return skip('trailing-user');
+    // 방금 내보낸 generation이 서버에 아직 반영되지 않았으면(최신 AI 답변이 그대로면) 컨텍스트를 읽기 전일 수 있다.
+    // 그 block은 건드리지 않고 이번 frame만 그대로 보낸다. 최신 답변이 바뀌었으면(완료·중단) 평소처럼 다시 평가한다.
+    if (justSent.some(row => !row.baselineLatestId || row.baselineLatestId === messageIdOf(frame.latest))) return skip('generation-in-progress');
     // B. 이전 generation 잔여물: 복구 기록 → 기록 없는 marker 순서로 정리한다.
     const residues = await cleanupChatResidues(chatId, signal, `before-${parsed.event}`);
     if (!residues.ok) return skip('residue-cleanup-failed');
@@ -716,11 +860,16 @@
     }
     // C~E. 원래 USER 입력으로 조건을 다시 평가한다. reroll은 서버의 직전 USER 본문을 쓴다.
     const payloadText = parsed.payload?.message ?? parsed.payload?.content ?? parsed.payload?.text;
-    const userText = conditionSourceText(parsed.event === 'send' && typeof payloadText === 'string' ? payloadText : messageTextOf(frame.latestUser));
-    const model = currentModelContext(parsed.payload, recent);
-    const request = { reason: parsed.event === 'reroll' ? 'before-reroll' : 'before-send', chatId, userText, recentText: visibleConversationText(recent), model };
+    const userTextSource = parsed.event !== 'send' ? 'server-latest-user' : typeof payloadText === 'string' ? 'payload' : 'unknown';
+    const userText = conditionSourceText(userTextSource === 'payload' ? payloadText : userTextSource === 'unknown' ? '' : messageTextOf(frame.latestUser));
+    diag.userTextSource = userTextSource;
+    await catalogReady;
+    const room = await roomModel; await ensureRoomModelKnown(room, signal);
+    const model = currentModelContext(parsed.payload, recent, room);
+    const request = { reason: parsed.event === 'reroll' ? 'before-reroll' : 'before-send', userText, recentText: visibleConversationText(recent), model };
     const planned = selectAutoOoc(data, request);
-    Object.assign(diag, { userChars: userText.length, modelDetected: planned.modelDetected, matched: planned.matched, selected: planned.selected, bundleChars: planned.chars });
+    Object.assign(diag, { userChars: userText.length, modelDetected: planned.modelDetected, matched: planned.matched, selected: planned.selected, omitted: planned.omitted, bundleChars: planned.chars });
+    if (needsModel) diag.model = { source: model.source, crackerModel: model.crackerModel, chatModelId: model.chatModelId, name: model.name || model.label };
     if (!planned.block) return skip(planned.matched.length ? 'over-budget' : 'no-matching-ooc');
     // F~G. WRMC가 고를 carrier를 같은 알고리즘으로 예측해 제외하고, 남은 것 중 가장 가까운 안정 assistant를 쓴다.
     const wish = detectWish(data, recent), choice = selectAutoCarrier(frame, wish.separate);
@@ -728,8 +877,8 @@
       carrierId: choice.carrierId, carriersSeparated: !!choice.carrierId && choice.carrierId !== choice.predictedWishId, rejectedCarriers: choice.rejected });
     if (!choice.carrier) return skip('no-independent-carrier');
     const generationId = (crypto.randomUUID?.() || `${Date.now()}_${Math.random().toString(36).slice(2)}`).replace(/[^A-Za-z0-9_-]/g, '_');
-    const record = { chatId, messageId: choice.carrierId, generationId, event: parsed.event, at: Date.now(), patched: false, journaled: false };
-    diag.generationId = generationId; request.generationKey = generationId;
+    const record = { chatId, messageId: choice.carrierId, generationId, event: parsed.event, at: Date.now(), patched: false, journaled: false, baselineLatestId: messageIdOf(frame.latest) };
+    diag.generationId = generationId; diagnosticsById.set(generationId, diag);
     live.set(generationId, { chatId, state: 'preparing', sentAt: 0, lastStreamAt: 0, socket });
     try {
       const result = await mutateCarrier(record, current => {
@@ -753,7 +902,7 @@
       });
       if (!result.verified) { live.delete(generationId); return skip(result.missing ? 'carrier-missing' : 'over-budget'); }
       const fitted = result.built.fitted.result;
-      Object.assign(diag, { selected: fitted.selected, bundleChars: fitted.chars, patched: true, verified: true, cleanup: 'pending' });
+      Object.assign(diag, { selected: fitted.selected, omitted: fitted.omitted, bundleChars: fitted.chars, patched: true, verified: true, cleanup: 'pending' });
       return record;
     } catch (error) {
       diag.skipReason = error?.reason || (error?.code === 'AUTO_OOC_ABORT' ? 'timeout' : 'patch-or-verify-failed'); diag.error = String(error?.message || error);
@@ -773,7 +922,7 @@
     socket.addEventListener('message', event => {
       const data = event.data; if (typeof data !== 'string') return;
       // 누적 스트림 chunk는 JSON으로 풀지 않고 watchdog 기준 시각만 갱신한다.
-      if (STREAM_CHUNK_PATTERN.test(data)) { for (const row of live.values()) if (row.socket === socket && row.state === 'armed') row.lastStreamAt = Date.now(); return; }
+      if (STREAM_CHUNK_PATTERN.test(data)) { if (!live.size) return; for (const row of live.values()) if (row.socket === socket && row.state === 'armed') row.lastStreamAt = Date.now(); touchLiveResidues(); return; }
       if (!live.size && !COMPLETED_FRAME_PATTERN.test(data)) return;
       const parsed = parseSocketFrame(data); if (!parsed) return;
       const reason = parsed.event === 'characterMessageGenerated' ? 'generation-completed' : /cancel/i.test(parsed.event) ? 'generation-cancelled' : /(?:error|failed)/i.test(parsed.event) ? 'generation-error' : '';
@@ -787,10 +936,6 @@
   }
   function looksLikeWishWrapper(fn) {
     try { return /sendNeedsPreparation|generationGates|WishHistory/.test(Function.prototype.toString.call(fn)); } catch { return false; }
-  }
-  function frameKey(parsed) {
-    const payload = parsed.payload || {}, requestId = parsed.ackId || payload.requestId || payload.generationId || payload.turnId || payload.data?.requestId;
-    return requestId ? `${payload.chatId || payload.data?.chatId}:${parsed.event}:${requestId}` : `${payload.chatId || payload.data?.chatId}:${parsed.event}:${String(parsed.raw).slice(-300)}`;
   }
   function installStandaloneInjector() {
     const previousSend = W.WebSocket?.prototype?.send; if (typeof previousSend !== 'function') return;
@@ -806,9 +951,9 @@
       const parsed = parseSocketFrame(data), chatId = String(parsed?.payload?.chatId || parsed?.payload?.data?.chatId || '');
       if (!parsed || !['send', 'reroll'].includes(parsed.event) || !chatId || chatId !== currentChatId()) return previousSend.call(this, data);
       if (library && (!library.autoSettings.autoInjectionEnabled || !allEntries(library).some(entry => entry.autoInjection.enabled))) return previousSend.call(this, data);
-      const socket = this, key = frameKey(parsed); if (inFlight.has(key)) { console.warn('[Crack OOC 보관함] 동일 generation 중복 hook을 무시했습니다.', key); return undefined; }
-      inFlight.add(key);
-      const previous = sendQueues.get(chatId) || Promise.resolve();
+      // 가로챈 frame은 어떤 경우에도 버리지 않는다. 같은 방의 frame은 들어온 순서대로 내보내고,
+      // 앞선 generation이 진행 중이면 뒤 frame은 자동 OOC 없이 그대로 넘긴다 (block은 generation당 하나).
+      const socket = this, previous = sendQueues.get(chatId) || Promise.resolve();
       const task = previous.catch(() => {}).then(async () => {
         const started = Date.now(), diag = { generationId: '', event: parsed.event, at: started, hook: hookInfo.position, patched: false, verified: false, cleanup: 'not-needed', skipReason: '', recoveryReason: '' };
         const controller = new PageAbortController(), timer = setTimeout(() => controller.abort(), PREPARE_TIMEOUT_MS); let record = null;
@@ -825,7 +970,7 @@
           if (record) { live.set(record.generationId, { chatId, state: 'armed', sentAt: 0, lastStreamAt: 0, socket }); scheduleCleanup('send-failed', row => row.generationId === record.generationId); }
         }
         recordDiagnostics(diag);
-      }).finally(() => { inFlight.delete(key); if (sendQueues.get(chatId) === task) sendQueues.delete(chatId); });
+      }).finally(() => { if (sendQueues.get(chatId) === task) sendQueues.delete(chatId); });
       sendQueues.set(chatId, task); return undefined;
     }
     autoOocSend.__crackOocLibraryAutoHook = true;
@@ -836,7 +981,7 @@
     // 새로고침·탭 종료로 남은 잔여물. 다른 탭이 방금 준비한 generation일 수 있으므로 충분히 지난 기록만 정리한다.
     setTimeout(() => {
       for (const row of loadResidues()) {
-        const wait = Math.max(0, LOAD_RECOVERY_MIN_AGE_MS - (Date.now() - Number(row.at || 0)));
+        const wait = Math.max(0, LOAD_RECOVERY_MIN_AGE_MS - (Date.now() - lastSeen(row)));
         setTimeout(() => scheduleCleanup('page-load', item => item.generationId === row.generationId && staleEnough(item)), wait + 50);
       }
     }, 1500);
@@ -845,6 +990,7 @@
     Object.defineProperty(W, '__CRACK_OOC_LIBRARY_TEST_API__', { configurable: true, value: {
       check, transport, selectAutoOoc, stableCarrierFrame, selectAutoCarrier, detectWish, removeAutoRegions, countAutoRegions, autoRegion, autoRegionOverhead,
       conditionSourceText, cleanupAutoRecord, cleanupChatResidues, injectAutoOoc, markerPattern, fitBundleForCarrier, loadResidues, diagnostics: autoDiagnostics, hookInfo, live,
+      modelGroups, legacyModelKey, refreshModelCatalog, currentModelContext,
     } });
   }
   function backup(data) {
@@ -889,7 +1035,7 @@
   }
   function drawTree(root, query) {
     root.replaceChildren(); const data = editing || library, needle = query.trim().toLocaleLowerCase();
-    const matches = item => [item.name, item.content, item.autoInjection.injectionBody, item.autoInjection.conditionValue].some(value => String(value || '').toLocaleLowerCase().includes(needle));
+    const matches = item => [item.name, item.content, item.autoInjection.conditionValue, item.autoInjection.modelName].some(value => String(value || '').toLocaleLowerCase().includes(needle));
     data.categories.forEach((folder, category) => {
       const { name, items } = folder, folderMatch = name.toLocaleLowerCase().includes(needle);
       if (needle && !folderMatch && !items.some(matches)) return;
@@ -975,37 +1121,61 @@
   function editOoc(category = -1, index) {
     if (saving) return; const data = editing || library;
     const current = index === undefined ? { id: newId(), name: '', content: '', autoInjection: { ...AUTO_DEFAULTS } } : contents(data, category)[index];
-    const view = dialog(index === undefined ? 'OOC 추가' : 'OOC 편집');
+    const rule = current.autoInjection, view = dialog(index === undefined ? 'OOC 추가' : 'OOC 편집');
     const name = field(view.body, '이름', 'input', current.name), body = field(view.body, '내용', 'textarea', current.content), folder = field(view.body, '카테고리', 'select'); body.rows = 9;
     folder.append(new Option('미분류', '-1')); data.categories.forEach((item, index) => folder.append(new Option(item.name, String(index)))); folder.value = String(category);
     const autoArea = node('section', 'oa-auto-editor'); autoArea.append(node('h3', '', '자동주입'));
-    const enabled = toggleField(autoArea, '이 OOC 자동주입', current.autoInjection.enabled, 'USER 입력문에는 붙이지 않고 숨은 assistant carrier 컨텍스트에만 추가합니다.');
+    const enabled = toggleField(autoArea, '이 OOC 자동주입', rule.enabled, '위의 내용을 그대로 씁니다. 보관함에서 위에 있는 OOC부터 들어가며, USER 입력문에는 붙이지 않습니다.');
     const condition = field(autoArea, '조건 유형', 'select');
     for (const [value, label] of [['always', '항상'], ['model', '모델'], ['userLength', 'USER 입력 글자수'], ['keyword', '키워드/트리거']]) condition.append(new Option(label, value));
-    condition.value = current.autoInjection.conditionType;
-    const conditionValue = field(autoArea, '조건값', 'input', current.autoInjection.conditionValue);
+    condition.value = rule.conditionType;
+    // 모델은 Crack이 내려주는 실제 목록에서 고른다. 2.0.2.x에서 직접 입력한 문자열은 목록과 정확히 맞으면 바꿔 주고, 아니면 그대로 둘 수 있다.
+    const legacyModel = rule.conditionType === 'model' && !rule.modelKey ? rule.conditionValue : '';
+    let chosenModel = rule.modelKey || (legacyModel ? LEGACY_MODEL_OPTION : '');
+    const model = field(autoArea, '대상 모델', 'select');
+    const knownModels = () => modelGroups().flatMap(group => group.options);
+    function drawModels(state) {
+      if (chosenModel === LEGACY_MODEL_OPTION) chosenModel = legacyModelKey(legacyModel) || LEGACY_MODEL_OPTION;
+      const groups = modelGroups(); model.replaceChildren();
+      model.append(new Option(groups.length ? '모델 선택' : state === 'loading' ? '모델 목록을 불러오는 중…' : '모델 목록을 불러오지 못했습니다', ''));
+      for (const group of groups) {
+        const box = node('optgroup'); box.label = group.label;
+        for (const option of group.options) if (!option.retired || option.key === chosenModel) box.append(new Option(option.retired ? `${option.name} (종료된 모델)` : option.name, option.key));
+        if (box.children.length) model.append(box);
+      }
+      if (chosenModel === LEGACY_MODEL_OPTION) model.append(new Option(`기존 입력값 유지: ${legacyModel}`, LEGACY_MODEL_OPTION));
+      else if (chosenModel && !knownModels().some(option => option.key === chosenModel)) model.append(new Option(`${rule.modelName || chosenModel} (현재 목록에 없음)`, chosenModel));
+      model.value = chosenModel;
+    }
+    model.addEventListener('change', () => { chosenModel = model.value; });
+    drawModels(modelCatalog.length ? 'ready' : 'loading');
+    void refreshModelCatalog().catch(() => []).then(() => { if (view.root.isConnected) drawModels('ready'); });
+    const conditionValue = field(autoArea, '조건값', 'input', rule.conditionType === 'model' ? '' : rule.conditionValue);
     const scope = field(autoArea, '키워드 검색 범위', 'select');
     for (const [value, label] of [['user', '현재 USER 입력'], ['recent', '최근 대화'], ['both', '현재 USER 입력 + 최근 대화']]) scope.append(new Option(label, value));
-    scope.value = current.autoInjection.keywordScope;
-    const priority = field(autoArea, '우선순위 (-999~999)', 'input', String(current.autoInjection.priority)); priority.type = 'number'; priority.min = '-999'; priority.max = '999'; priority.step = '1';
-    const injectionBody = field(autoArea, '주입용 본문', 'textarea', current.autoInjection.injectionBody); injectionBody.rows = 6; injectionBody.placeholder = '비우면 위의 기존 OOC 내용을 사용합니다.';
+    scope.value = rule.keywordScope;
     const hint = node('p', 'oa-hint'); autoArea.append(hint); view.body.append(autoArea);
     function syncConditionUi() {
-      const type = condition.value; scope.closest('.oa-field').hidden = type !== 'keyword'; conditionValue.closest('.oa-field').hidden = type === 'always';
-      conditionValue.placeholder = type === 'model' ? '예: hyperchat 또는 하이퍼챗 1.0 (쉼표/줄바꿈으로 복수)' : type === 'userLength' ? '예: 500+, 800~1500, 1500 이상' : '쉼표 또는 줄바꿈으로 여러 키워드';
-      hint.textContent = type === 'model' ? '전송 payload·직전 AI 답변의 crackerModel/chatModelId/model과 현재 모델 표시명을 정확히 비교합니다. 모델을 확인하지 못한 턴에는 이 OOC만 빠집니다.' : type === 'userLength' ? '현재 전송하려는 USER 문자열의 JavaScript length를 로컬에서 계산합니다. 에리 로어 블록 등 다른 확장이 붙인 내용은 세지 않습니다.' : type === 'keyword' ? '대소문자를 구분하지 않는 포함 검색입니다.' : '매 전송/리롤의 자동주입 후보가 됩니다.';
+      const type = condition.value; scope.closest('.oa-field').hidden = type !== 'keyword'; model.closest('.oa-field').hidden = type !== 'model';
+      conditionValue.closest('.oa-field').hidden = type === 'always' || type === 'model';
+      conditionValue.placeholder = type === 'userLength' ? '예: 500+, 800~1500, 1500 이상' : '쉼표 또는 줄바꿈으로 여러 키워드';
+      hint.textContent = type === 'model' ? '이 방에서 지금 선택된 모델과 비교합니다. 모델을 확인하지 못한 턴에는 이 OOC만 빠집니다.' : type === 'userLength' ? '현재 전송하려는 USER 문자열의 JavaScript length를 로컬에서 계산합니다. 에리 로어 블록 등 다른 확장이 붙인 내용은 세지 않습니다.' : type === 'keyword' ? '대소문자를 구분하지 않는 포함 검색입니다.' : '매 전송/리롤의 자동주입 후보가 됩니다.';
     }
     condition.addEventListener('change', syncConditionUi); syncConditionUi();
     view.footer.append(action('취소', view.close), action('적용', () => {
       const title = name.value.trim(); if (!title || Array.from(title).length > 20) throw Error('이름은 1~20자로 입력하세요.');
-      const priorityValue = Number(priority.value); if (!Number.isInteger(priorityValue) || priorityValue < -999 || priorityValue > 999) throw Error('우선순위는 -999~999 정수로 입력하세요.');
-      if (enabled.checked && condition.value !== 'always' && !conditionValue.value.trim()) throw Error('선택한 자동주입 조건값을 입력하세요.');
-      if (condition.value === 'userLength' && !parseLengthCondition(conditionValue.value)) throw Error('글자수 조건은 500+, 800~1500, 1500 이상처럼 입력하세요.');
+      const type = condition.value; let value = type === 'model' ? '' : conditionValue.value.trim(), modelKey = '', modelName = '';
+      if (type === 'model') {
+        if (chosenModel === LEGACY_MODEL_OPTION) value = legacyModel;
+        else if (chosenModel) { modelKey = chosenModel; modelName = knownModels().find(option => option.key === chosenModel)?.name || rule.modelName || ''; }
+        if (enabled.checked && !modelKey && !value) throw Error('대상 모델을 선택하세요.');
+      } else if (enabled.checked && type !== 'always' && !value) throw Error('선택한 자동주입 조건값을 입력하세요.');
+      if (type === 'userLength' && !parseLengthCondition(value)) throw Error('글자수 조건은 500+, 800~1500, 1500 이상처럼 입력하세요.');
       change(data => {
-        const to = Number(folder.value), value = { id: current.id, name: title, content: body.value, autoInjection: normalizeAuto({ enabled: enabled.checked, conditionType: condition.value, conditionValue: conditionValue.value.trim(), keywordScope: scope.value, priority: priorityValue, injectionBody: injectionBody.value }) };
-        if (index === undefined) contents(data, to).push(value);
-        else if (to === category) contents(data, category)[index] = value;
-        else { contents(data, category).splice(index, 1); contents(data, to).push(value); }
+        const to = Number(folder.value), entry = { id: current.id, name: title, content: body.value, autoInjection: normalizeAuto({ enabled: enabled.checked, conditionType: type, conditionValue: value, keywordScope: scope.value, modelKey, modelName }) };
+        if (index === undefined) contents(data, to).push(entry);
+        else if (to === category) contents(data, category)[index] = entry;
+        else { contents(data, category).splice(index, 1); contents(data, to).push(entry); }
       }); view.close();
     }, null, 'oa-primary')); closeWithEscape(view); name.focus();
   }
@@ -1029,9 +1199,11 @@
       const result = selectAutoOoc(draft, { ...context, reason: 'preview', maxChars: Number(maxChars.value) });
       previewList.replaceChildren();
       if (!result.selected.length) previewList.append(node('span', 'oa-muted', '현재 조건에 맞는 OOC가 없습니다.'));
-      else result.selected.forEach(item => previewList.append(node('div', '', `- ${item.name} (우선순위 ${item.priority})`)));
-      if (result.selected.length) previewList.append(node('small', '', `예상 ${result.chars.toLocaleString()}자 / 최대 ${result.maxChars.toLocaleString()}자`));
-      if (result.omitted) previewList.append(node('small', '', `한도 때문에 제외 ${result.omitted}개`));
+      else result.selected.forEach((item, order) => previewList.append(node('div', '', `${order + 1}. ${item.name}`)));
+      if (result.selected.length) previewList.append(node('small', '', `보관함 순서대로 적용 · 예상 ${result.chars.toLocaleString()}자 / 최대 ${result.maxChars.toLocaleString()}자`));
+      const overBudget = result.omitted.filter(item => item.reason === 'over-budget');
+      if (overBudget.length) previewList.append(node('small', '', `한도 때문에 제외: ${overBudget.map(item => item.name).join(', ')}`));
+      if (allEntries(draft).some(item => item.autoInjection.enabled && item.autoInjection.conditionType === 'model')) previewList.append(node('small', '', result.modelDetected ? `현재 모델: ${context.model?.name || context.model?.label || context.model?.crackerModel || '확인됨'}` : '현재 모델을 확인하지 못해 모델 조건 OOC는 빠집니다.'));
       if (context.frame) {
         const choice = selectAutoCarrier(context.frame, detectWish(draft, context.frame.messages).separate);
         previewList.append(node('small', '', context.frame.trailingUser ? '주입 대상: 답 없는 USER가 마지막이라 이번 턴은 건너뜁니다.' : !choice.carrier ? '주입 대상: 독립된 과거 AI 답변이 없어 이번 턴은 건너뜁니다.' : choice.carrierId !== choice.predictedWishId ? '주입 대상: WRMC와 분리된 과거 AI 답변' : '주입 대상: 최신 직전의 과거 AI 답변'));
@@ -1077,9 +1249,10 @@
     if (!chatId) return base;
     const controller = new PageAbortController(), timer = setTimeout(() => controller.abort(), 3000);
     try {
-      const messages = await fetchRecentMessages(chatId, controller.signal, 30);
+      const [messages, room] = await Promise.all([fetchRecentMessages(chatId, controller.signal, 30), fetchRoomModel(chatId, controller.signal).catch(() => null), refreshModelCatalog(controller.signal).catch(() => [])]);
       let frame = null; try { frame = stableCarrierFrame(messages); } catch { /* carrier 표시만 생략한다. */ }
-      return { ...base, chatId, frame, userText: conditionSourceText(base.userText), recentText: visibleConversationText(messages), model: currentModelContext(null, messages) };
+      await ensureRoomModelKnown(room, controller.signal);
+      return { ...base, chatId, frame, userText: conditionSourceText(base.userText), recentText: visibleConversationText(messages), model: currentModelContext(null, messages, room) };
     } catch (error) {
       console.info('[Crack OOC 보관함] 미리보기 최근 대화 조회 생략', error);
       return { ...base, chatId };
@@ -1226,24 +1399,50 @@
     }); library.extras.forEach(item => panel.body.append(ooc(item)));
   }
   function drawPanels() { attached.forEach(panel => { if (panel.active) drawPanel(panel); }); }
+  // OOC 탭의 글자 굵기·색은 값을 따로 정하지 않고 Crack 기본 탭의 실제 계산값(선택됨/선택 안 됨)을 그대로 쓴다.
+  // OOC 보관함이 열려 있는 동안에는 Crack이 마지막으로 선택해 둔 기본 탭(내용은 가려진 상태)을 선택 안 된 탭처럼 보이게 한다.
+  const nativeTabSelected = tab => tab.getAttribute('aria-selected') === 'true' || tab.dataset.state === 'active';
+  function syncTabStyle(panel) {
+    const tabs = panel.tabs; if (!tabs) return;
+    // 먼저 지난번에 바꿔 둔 기본 탭을 원래대로 돌린다. OOC 탭이 화면에서 빠진 뒤에도 반드시 되돌아가야 한다.
+    for (const tab of tabs.querySelectorAll('[data-oa-dimmed]')) { tab.style.removeProperty('font-weight'); tab.style.removeProperty('color'); delete tab.dataset.oaDimmed; }
+    if (panel.button.parentElement !== tabs) return;
+    const native = Array.from(tabs.querySelectorAll('[role="tab"]')).filter(tab => tab !== panel.button), selected = nativeTabSelected;
+    // 글자가 안쪽 요소 하나에 들어 있으면 그 요소의 계산값을 읽는다.
+    const textElement = tab => { let element = tab; while (element.children.length === 1 && element.children[0].textContent.trim() === tab.textContent.trim()) element = element.children[0]; return element; };
+    const read = tab => { if (!tab) return null; const style = getComputedStyle(textElement(tab)); return { weight: style.fontWeight, color: style.color }; };
+    const inactive = read(native.find(tab => !selected(tab))), active = read(native.find(selected));
+    for (const [suffix, sample] of [['', inactive], ['-active', active]]) {
+      if (!sample) continue;
+      panel.button.style.setProperty(`--oa-tab${suffix}-weight`, sample.weight); panel.button.style.setProperty(`--oa-tab${suffix}-color`, sample.color);
+    }
+    if (panel.active && inactive) for (const tab of native.filter(selected)) { tab.style.setProperty('font-weight', inactive.weight); tab.style.setProperty('color', inactive.color); tab.dataset.oaDimmed = '1'; }
+  }
   function panelMode(panel, enabled) {
     panel.active = enabled; panel.body.hidden = !enabled; panel.native.forEach(element => { element.classList.toggle('oa-native-hidden', enabled); }); panel.button.classList.toggle('oa-tab-active', enabled); panel.button.setAttribute('aria-pressed', String(enabled));
+    try { syncTabStyle(panel); } catch { /* 기본 굵기(일반/선택 시 굵게)로 표시된다. */ }
   }
   function discover() {
     for (const [root, panel] of attached) if (!root.isConnected || !panel.button.isConnected) {
-      panelMode(panel, false); panel.body.remove(); panel.button.remove(); panel.config.remove(); attached.delete(root);
+      panelMode(panel, false); panel.watch?.disconnect(); panel.body.remove(); panel.button.remove(); panel.config.remove(); attached.delete(root);
     }
     document.querySelectorAll('[role="tablist"]').forEach(tabs => {
       const hub = Array.from(tabs.querySelectorAll('[role="tab"]')).find(tab => tab.textContent.trim() === '단축어 허브'); if (!hub) return;
       const root = tabs.parentElement.parentElement; if (attached.has(root)) return;
       const native = Array.from(root.children).slice(1); if (!native.some(element => element.querySelector('ul'))) return;
-      const panel = { native, body: node('div', 'oa-panel-body'), active: false }; panel.body.hidden = true; panel.body.setAttribute('aria-label', 'OOC 목록');
+      const panel = { native, tabs, body: node('div', 'oa-panel-body'), active: false }; panel.body.hidden = true; panel.body.setAttribute('aria-label', 'OOC 목록');
       panel.button = action('OOC 보관함', async () => {
         bookmark(); await readLibrary(); panelMode(panel, true); drawPanel(panel);
       }, null, 'oa-tab'); panel.button.addEventListener('pointerdown', event => { bookmark(); event.preventDefault(); });
       panel.config = action('OOC 설정', showManager, 'gear', 'oa-panel-config'); panel.config.addEventListener('pointerdown', event => { bookmark(); event.preventDefault(); });
       tabs.append(panel.button, panel.config); tabs.classList.add('oa-tabs'); root.append(panel.body); attached.set(root, panel);
+      panel.button.setAttribute('aria-pressed', 'false'); try { syncTabStyle(panel); } catch { /* 기본 굵기로 표시된다. */ }
       tabs.addEventListener('click', event => { if (event.target.closest('[role="tab"]')) panelMode(panel, false); });
+      // 클릭이 아닌 방법(키보드 이동 등)으로 Crack 기본 탭이 새로 선택돼도 OOC 보관함을 닫아 굵기를 되돌린다.
+      panel.watch = new MutationObserver(records => {
+        if (panel.active && records.some(record => record.target.getAttribute?.('role') === 'tab' && record.oldValue !== record.target.getAttribute(record.attributeName) && nativeTabSelected(record.target))) panelMode(panel, false);
+      });
+      panel.watch.observe(tabs, { subtree: true, attributes: true, attributeFilter: ['aria-selected', 'data-state'], attributeOldValue: true });
     });
   }
   // OOC 항목의 포커스를 보존하며 기본 단축어의 Enter 선택만 막는다.
@@ -1261,10 +1460,10 @@
     .oa-dialog{--oa-bg:hsl(var(--card,0 0% 9%));--oa-fg:hsl(var(--foreground,0 0% 98%));--oa-muted:hsl(var(--muted-foreground,0 0% 58%));--oa-line:hsl(var(--border,0 0% 22%));--oa-accent:#a5a0f5;color:var(--oa-fg);background:var(--oa-bg);border:1px solid var(--oa-line);border-radius:16px;padding:0;width:min(520px,calc(100vw - 32px));max-height:86vh;box-shadow:0 24px 80px #0007;font:14px/1.5 system-ui}
     .oa-dialog [hidden]{display:none!important}.oa-dialog::backdrop{background:#0007}.oa-dialog.oa-large{width:min(680px,calc(100vw - 32px))}.oa-dialog.oa-guide{width:min(620px,calc(100vw - 32px))}.oa-header{display:flex;align-items:center;gap:8px;height:64px;padding:0 20px;border-bottom:1px solid var(--oa-line)}.oa-header strong{font-size:16px;font-weight:650}.oa-header>.oa-icon{margin-left:auto}.oa-actions{display:flex;gap:4px;margin-left:auto}.oa-dot{width:7px;height:7px;background:#f06b73;border-radius:50%}.oa-body{padding:20px;overflow:auto;max-height:calc(86vh - 142px)}.oa-large .oa-body{min-height:260px;max-height:calc(86vh - 66px)}.oa-footer{display:flex;justify-content:flex-end;gap:8px;padding:12px 20px;border-top:1px solid var(--oa-line)}
     .oa-dialog button{font:inherit;cursor:pointer}.oa-icon{display:inline-flex;align-items:center;justify-content:center;width:32px;height:32px;padding:6px;border:0;border-radius:6px;background:transparent;color:var(--oa-muted,currentColor);flex-shrink:0}.oa-icon svg, .oa-symbol svg,.oa-search svg,.oa-toggle svg,.oa-list-folder svg{width:20px;height:20px;display:block;flex-shrink:0}.oa-icon:hover,.oa-toggle:hover{background:#8882;color:var(--oa-fg,inherit)}.oa-dialog button:disabled{opacity:.35;cursor:default}.oa-dialog button:focus-visible,.oa-dialog summary:focus-visible{outline:2px solid var(--oa-accent);outline-offset:2px}.oa-button{border:1px solid var(--oa-line);background:transparent;color:inherit;border-radius:8px;padding:7px 14px}.oa-primary{background:var(--oa-accent);color:#171724;border-color:transparent}.oa-toolbar{display:flex;align-items:center;gap:6px;margin-bottom:14px}.oa-search{display:flex;align-items:center;gap:8px;flex:1;border:1px solid var(--oa-line);border-radius:8px;padding:0 10px;color:var(--oa-muted)}
-    .oa-dialog input,.oa-dialog textarea,.oa-dialog select{color:inherit;background:transparent;border:1px solid var(--oa-line);border-radius:8px;padding:9px 10px;font:inherit;width:100%;box-sizing:border-box;min-width:0}.oa-search input{border:0;outline:none;padding:9px 0}.oa-field{display:flex;flex-direction:column;gap:7px;margin-bottom:16px}.oa-field>span{font-size:13px;color:var(--oa-muted)}.oa-dialog textarea{resize:vertical;white-space:pre-wrap}.oa-dialog select option{color:#eee;background:#222}.oa-toggle-field{display:grid;grid-template-columns:auto 1fr;gap:4px 9px;align-items:center;margin:0 0 16px}.oa-toggle-field input{width:18px;height:18px}.oa-toggle-field small{grid-column:2;color:var(--oa-muted);line-height:1.45}.oa-hint{margin:-8px 0 14px;color:var(--oa-muted);font-size:12px;line-height:1.5}.oa-auto-editor,.oa-settings-section{border-top:1px solid var(--oa-line);padding-top:16px;margin-top:4px}.oa-settings-section{border:1px solid var(--oa-line);border-radius:10px;padding:14px;margin-bottom:22px}.oa-preview{margin-top:12px;padding:10px;border-radius:8px;background:#8881}.oa-preview strong{display:block;margin-bottom:6px}.oa-preview-list{white-space:pre-wrap}.oa-preview-list small{display:block;color:var(--oa-muted);margin-top:6px}.oa-muted{color:var(--oa-muted)}.oa-diagnostics{margin-top:12px}.oa-diagnostics summary{cursor:pointer;color:var(--oa-muted);font-size:12px}.oa-diagnostics pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#8881;border-radius:6px;padding:10px;margin:8px 0 0;font-size:11px;max-height:240px;overflow:auto}
+    .oa-dialog input,.oa-dialog textarea,.oa-dialog select{color:inherit;background:transparent;border:1px solid var(--oa-line);border-radius:8px;padding:9px 10px;font:inherit;width:100%;box-sizing:border-box;min-width:0}.oa-search input{border:0;outline:none;padding:9px 0}.oa-field{display:flex;flex-direction:column;gap:7px;margin-bottom:16px}.oa-field>span{font-size:13px;color:var(--oa-muted)}.oa-dialog textarea{resize:vertical;white-space:pre-wrap}.oa-dialog select option{color:#eee;background:#222}.oa-dialog select optgroup{color:#aaa;background:#222;font-style:normal}.oa-toggle-field{display:grid;grid-template-columns:auto 1fr;gap:4px 9px;align-items:center;margin:0 0 16px}.oa-toggle-field input{width:18px;height:18px}.oa-toggle-field small{grid-column:2;color:var(--oa-muted);line-height:1.45}.oa-hint{margin:-8px 0 14px;color:var(--oa-muted);font-size:12px;line-height:1.5}.oa-auto-editor,.oa-settings-section{border-top:1px solid var(--oa-line);padding-top:16px;margin-top:4px}.oa-settings-section{border:1px solid var(--oa-line);border-radius:10px;padding:14px;margin-bottom:22px}.oa-preview{margin-top:12px;padding:10px;border-radius:8px;background:#8881}.oa-preview strong{display:block;margin-bottom:6px}.oa-preview-list{white-space:pre-wrap}.oa-preview-list small{display:block;color:var(--oa-muted);margin-top:6px}.oa-muted{color:var(--oa-muted)}.oa-diagnostics{margin-top:12px}.oa-diagnostics summary{cursor:pointer;color:var(--oa-muted);font-size:12px}.oa-diagnostics pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#8881;border-radius:6px;padding:10px;margin:8px 0 0;font-size:11px;max-height:240px;overflow:auto}
     .oa-group{margin:8px 0;border:1px solid var(--oa-line);border-radius:10px;overflow:visible}.oa-group>.oa-row{background:#8881;border-radius:9px}.oa-row{position:relative;display:flex;align-items:center;gap:9px;min-height:44px;padding:4px 8px;box-sizing:border-box}.oa-name{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.oa-group>.oa-row>.oa-name{font-weight:600;cursor:pointer}.oa-symbol{color:var(--oa-muted);flex-shrink:0}.oa-group>.oa-row>.oa-symbol{color:#c4b391}.oa-count{color:var(--oa-muted);font-size:12px}.oa-auto-badge{font-size:11px;color:#b9b5ff;border:1px solid #a5a0f555;border-radius:999px;padding:1px 6px}.oa-row-actions{display:flex;gap:2px}.oa-row-actions .oa-icon{width:28px;height:28px;padding:5px}.oa-row-actions .oa-icon[data-sort]{cursor:grab;touch-action:none}.oa-toggle{width:20px;height:28px;border:0;padding:0;background:transparent;color:var(--oa-muted);flex-shrink:0}.oa-toggle svg{width:16px;height:16px;transition:transform .15s}.oa-open .oa-toggle svg{transform:rotate(90deg)}.oa-children{margin:0 12px 10px 30px;padding-left:8px;border-left:2px solid var(--oa-line)}.oa-children .oa-row+.oa-row{border-top:1px solid #8882}.oa-extras{margin-top:14px}.oa-extras>.oa-row{border-bottom:1px solid #8882}.oa-empty{height:28px}.oa-before::before,.oa-after::after{content:'';position:absolute;left:0;right:0;height:3px;background:var(--oa-accent);border-radius:3px;z-index:2;pointer-events:none}.oa-before::before{top:0}.oa-after::after{bottom:0}.oa-children,.oa-extras{position:relative}.oa-dragging{opacity:.3}.oa-ghost{position:fixed;pointer-events:none;z-index:3;background:var(--oa-bg);border:1px solid var(--oa-line);border-radius:8px;box-shadow:0 8px 24px #0006;opacity:.95}
     .oa-message{white-space:pre-line;margin:0 0 14px;line-height:1.7}.oa-warning{color:#ed969e;background:#eb6b7410;border:1px solid #eb6b7440;border-radius:8px;padding:12px}.oa-source-options{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin:14px 0}.oa-source{display:flex;flex-direction:column;align-items:flex-start;gap:8px;padding:14px}.oa-source span{font-size:12px;color:var(--oa-muted)}.oa-source.oa-selected{border-color:var(--oa-accent);background:#a5a0f512}.oa-backup{display:flex;gap:8px}.oa-body h3{margin:0 0 14px;font-size:14px}.oa-db-top{display:flex;align-items:center;gap:8px;margin-bottom:16px}.oa-segment{display:flex;padding:3px;border-radius:9px;background:#8882;flex:1}.oa-segment label{flex:1;text-align:center;cursor:pointer}.oa-segment input{position:absolute;opacity:0;width:1px;height:1px}.oa-segment span{display:block;border-radius:6px;padding:7px 12px;color:var(--oa-muted)}.oa-segment input:checked+span{color:var(--oa-fg);background:var(--oa-bg);box-shadow:0 1px 4px #0003}.oa-segment input:focus-visible+span{outline:2px solid var(--oa-accent)}.oa-credentials{display:grid;grid-template-columns:minmax(0,1.2fr) minmax(0,1fr) auto;gap:8px;align-items:center}.oa-credentials .oa-button{padding:9px 12px}.oa-auth-state{font-size:12px;color:var(--oa-muted);min-height:18px;margin:10px 0 0}.oa-guide-section{border-bottom:1px solid var(--oa-line);padding:12px 0}.oa-guide-section:first-child{padding-top:0}.oa-guide-section summary{cursor:pointer;font-weight:600}.oa-guide-section ol{padding-left:23px}.oa-guide-section li{margin:8px 0;line-height:1.7}.oa-guide-section pre{white-space:pre-wrap;background:#8881;border-radius:6px;padding:10px;font-size:12px}.oa-guide-section small{color:var(--oa-muted);overflow-wrap:anywhere}
-    .oa-native-hidden{display:none!important}.oa-tabs{overflow-x:auto!important;overflow-y:hidden!important;flex-wrap:nowrap!important}.oa-tab{background:transparent;border:0;border-bottom:2px solid transparent;padding:0 8px 8px;margin-bottom:-1px;flex-shrink:0;font-size:14px;color:inherit;white-space:nowrap;border-radius:0}.oa-tab-active{border-bottom-color:currentColor;font-weight:600}.oa-panel-config{width:28px;height:28px;margin-bottom:6px}.oa-panel-body{min-height:0;flex:1;overflow:auto;padding:8px 16px;font-size:14px}.oa-panel-body[hidden]{display:none}.oa-use{display:block;border:0;background:transparent;color:inherit;padding:8px;width:100%;text-align:left;border-radius:6px;font-size:14px}.oa-use:hover{background:#8882}.oa-list-folder summary{display:flex;align-items:center;gap:8px;padding:8px 0;cursor:pointer;font-weight:600;list-style:none}.oa-list-folder summary::-webkit-details-marker{display:none}.oa-list-folder summary svg:first-child{width:14px;height:14px}.oa-list-folder[open] summary svg:first-child{transform:rotate(90deg)}.oa-list-folder>.oa-use{margin-left:20px;width:calc(100% - 20px);padding-left:12px;border-left:2px solid #8884;border-radius:0}
+    .oa-native-hidden{display:none!important}.oa-tabs{overflow-x:auto!important;overflow-y:hidden!important;flex-wrap:nowrap!important}.oa-tab{background:transparent;border:0;border-bottom:2px solid transparent;padding:0 8px 8px;margin-bottom:-1px;flex-shrink:0;font-size:14px;font-weight:var(--oa-tab-weight,400);color:var(--oa-tab-color,inherit);white-space:nowrap;border-radius:0}.oa-tab.oa-tab-active{border-bottom-color:currentColor;font-weight:var(--oa-tab-active-weight,600);color:var(--oa-tab-active-color,inherit)}.oa-panel-config{width:28px;height:28px;margin-bottom:6px}.oa-panel-body{min-height:0;flex:1;overflow:auto;padding:8px 16px;font-size:14px}.oa-panel-body[hidden]{display:none}.oa-use{display:block;border:0;background:transparent;color:inherit;padding:8px;width:100%;text-align:left;border-radius:6px;font-size:14px}.oa-use:hover{background:#8882}.oa-list-folder summary{display:flex;align-items:center;gap:8px;padding:8px 0;cursor:pointer;font-weight:600;list-style:none}.oa-list-folder summary::-webkit-details-marker{display:none}.oa-list-folder summary svg:first-child{width:14px;height:14px}.oa-list-folder[open] summary svg:first-child{transform:rotate(90deg)}.oa-list-folder>.oa-use{margin-left:20px;width:calc(100% - 20px);padding-left:12px;border-left:2px solid #8884;border-radius:0}
     @media(max-width:480px){.oa-header{padding:0 12px}.oa-body{padding:14px}.oa-row-actions{gap:0}.oa-children{margin-left:22px}.oa-credentials{gap:5px}.oa-credentials input{padding:8px 6px}.oa-credentials .oa-button{padding:8px}.oa-source-options{gap:6px}.oa-source{padding:10px}}
   `; document.head.append(styles);
   let queued = false;
