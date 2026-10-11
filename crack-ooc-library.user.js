@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Crack OOC 보관함
 // @namespace    crack.ooc.library
-// @version      3.0.2.0
+// @version      3.0.2.1
 // @description  OOC를 보관하고 안전한 assistant carrier에 독립적으로 자동 컨텍스트를 주입 (version 관리방식: 데이터구조버전.크랙UI변경.기능추가및수정.버그수정)
 // @match        https://crack.wrtn.ai/*
 // @noframes
@@ -54,6 +54,8 @@
  * - WRMC가 감지되면 WRMC stableFrame이 고를 carrier와 WISH marker가 있는 메시지를 피해 별도 carrier를 쓴다.
  * - 3.0.2.0: 독립 carrier가 없으면 RP Manager가 쓰는 답변을 함께 쓴다 (shared). 서버의 지금 본문 전체를 그대로 두고 맨 뒤에 AUTO 구간만 붙였다 뗀다.
  * - 함께 쓸 답변도 없거나 어떤 단계든 실패하면 그 generation의 자동 OOC만 건너뛰고 원래 전송은 그대로 보낸다.
+ * - 3.0.2.1: generation 요청은 send / reroll / continue("이어서 생성") 셋이다. 서버의 마지막 메시지가 USER인 채로 오는 continue는
+ *   그 USER에 답하는 정상 요청이다 (답을 지우고 다시 만들 때). 이때는 남아 있는 과거 AI 답변이 모두 carrier 후보다.
  * - hook 설치 순서(WRMC/에리 wrapper의 안쪽·바깥쪽)는 동작 조건이 아니다. 실제 위치는 진단에만 표시한다.
  */
 (() => {
@@ -77,6 +79,11 @@
   const CARRIER_SEARCH_DEPTH = 4;
   // carrier를 쓰는 방식. separate: 다른 도구가 쓰지 않는 과거 AI 답변. shared: 독립된 답변이 없어 RP Manager가 쓰는 답변 끝에 함께 붙인다.
   const CARRIER_SEPARATE = 'separate', CARRIER_SHARED = 'shared-rp-manager';
+  // 자동 OOC를 붙이는 generation 요청. Crack 프런트엔드가 소켓으로 내보내는 이름 그대로다:
+  // send { chatId, message, prevMessageId, … }, reroll { chatId, instruction, … }, continue { chatId, prevMessageId, … } ("이어서 생성" 버튼, 빈 입력으로 진행).
+  const GENERATION_EVENTS = ['send', 'reroll', 'continue'];
+  // 요청의 뜻. event 이름과 서버의 대화 구조로 정한다 (generationFrame).
+  const GENERATION_MODES = Object.freeze({ send: 'send-new-user', reroll: 'reroll-assistant', answer: 'answer-existing-user', extend: 'continue-after-assistant' });
   // 읽고 쓰는 사이에 다른 도구가 같은 메시지를 고쳤을 때 최신 본문으로 다시 해 보는 횟수.
   const CARRIER_CONFLICT_RETRIES = 2;
   // shared carrier는 응답 스트림 frame이 처음보다 이만큼(글자) 길어지면 뗀다.
@@ -536,7 +543,7 @@
     const maxChars = Math.max(0, Math.min(configured.autoOocMaxChars, Number.isFinite(requested) ? Math.trunc(requested) : configured.autoOocMaxChars));
     const overhead = Number.isFinite(Number(request.overhead)) ? Math.max(0, Number(request.overhead)) : autoRegionOverhead();
     const modelDetected = modelValues(request.model).length > 0;
-    if (!configured.autoInjectionEnabled || !['before-send', 'before-reroll'].includes(request.reason) || maxChars <= 0) return { block: '', selected: [], matched: [], omitted: [], maxChars, chars: 0, modelDetected };
+    if (!configured.autoInjectionEnabled || !GENERATION_EVENTS.some(event => request.reason === `before-${event}`) || maxChars <= 0) return { block: '', selected: [], matched: [], omitted: [], maxChars, chars: 0, modelDetected };
     const seen = new Set(), omitted = [], summary = row => ({ id: row.entry.id, name: row.entry.name, libraryOrder: row.order + 1 });
     const candidates = allEntries(data).map((entry, order) => ({ entry, order, rendered: renderAutoItem(entry) }))
       .filter(row => row.entry.autoInjection.enabled && row.rendered && entryMatches(row.entry, request))
@@ -594,6 +601,20 @@
     // carrier(= stable[0])는 WRMC stableFrame()이 이번 generation에서 고를 메시지와 같다.
     const stable = userIndex < 0 ? [] : messages.filter((message, index) => index > userIndex && messageRoleOf(message) === 'assistant');
     return { messages, latest, latestUser, carrier, stable, trailingUser: messageRoleOf(messages[0]) === 'user' };
+  }
+  // 이번 요청이 어떤 generation인지(event 이름만이 아니라 서버의 지금 대화 구조로 판단)와, 그때 컨텍스트에 그대로 남는 과거 assistant(stable)를 정한다.
+  // - 마지막이 assistant: send는 새 USER를 보내는 것, reroll은 그 assistant를 다시 만드는 것, continue는 그 assistant 뒤를 잇는 것이다.
+  //   stable은 stableCarrierFrame 그대로다 (최신 assistant와 그 앞 USER보다 오래된 답).
+  // - 마지막이 USER: 그 USER의 답이 아직 없다 (예: 답을 지운 뒤 "이어서 생성"). continue는 그 USER에 답하는 요청이다(answer-existing-user).
+  //   지워진 답은 서버에 없으므로, 남아 있는 assistant는 모두 그 USER보다 앞에서 이미 끝난 답이다. 가장 가까운 것도 다시 만들 대상이 아니다.
+  //   그래서 전부 stable이고, RP Manager가 쓸 것으로 보는 자리(carrier)도 그 가운데 가장 가까운 답이다.
+  //   send는 답 없는 USER 뒤에 새 USER를 보내는 것이라 같은 stable을 쓴다. reroll은 다시 만들 assistant가 없으므로 다루지 않는다 (mode '').
+  function generationFrame(newestFirst, event) {
+    const frame = stableCarrierFrame(newestFirst);
+    if (!frame.trailingUser) return { ...frame, targetUser: null, mode: event === 'reroll' ? GENERATION_MODES.reroll : event === 'continue' ? GENERATION_MODES.extend : GENERATION_MODES.send };
+    const stable = frame.messages.filter(message => messageRoleOf(message) === 'assistant');
+    return { ...frame, stable, carrier: stable[0] || null, latest: stable[0] || null, targetUser: frame.messages[0],
+      mode: event === 'continue' ? GENERATION_MODES.answer : event === 'send' ? GENERATION_MODES.send : '' };
   }
   // WRMC가 실제로 PATCH하는 대상은 (1) stableFrame carrier, (2) 이미 WISH marker가 있는 메시지뿐이다.
   // 둘 다 후보에서 빼면 marker가 아직 안 붙은 경우와 이전 carrier 정리 대기 중인 경우를 모두 피한다.
@@ -958,7 +979,11 @@
       const assistant = messageRoleOf(message) === 'assistant', text = assistant ? visibleAssistantText(messageTextOf(message)) : conditionSourceText(messageTextOf(message)).replace(/<!--[\s\S]*?-->/g, '').trim();
       return text ? `${assistant ? 'AI' : 'USER'}: ${clip(text, 1500)}` : '';
     }).filter(Boolean);
-    const now = context.event === 'reroll' ? '[지금 상황]\n위의 마지막 AI 응답을 지우고 다시 생성하려는 참이다.' : `[지금 보내려는 USER 입력]\n${clip(String(context.userText || '').trim(), 2000) || '(내용 없음)'}`;
+    // 지금 무엇을 하려는지. 새 USER를 보낼 때만 그 입력을 따로 싣는다. 이미 서버에 있는 USER에 답하는 요청은 그 USER가 위 대화의 마지막 줄에 있으므로 다시 싣지 않는다.
+    const now = context.mode === GENERATION_MODES.reroll ? '[지금 상황]\n위의 마지막 AI 응답을 지우고 다시 생성하려는 참이다.'
+      : context.mode === GENERATION_MODES.answer ? '[지금 상황]\n위의 마지막 USER 메시지에 대한 AI 응답을 지금 생성하려는 참이다.'
+      : context.mode === GENERATION_MODES.extend ? '[지금 상황]\n위의 마지막 AI 응답에 이어서 다음 AI 응답을 생성하려는 참이다.'
+      : `[지금 보내려는 USER 입력]\n${clip(String(context.userText || '').trim(), 2000) || '(내용 없음)'}`;
     return `[최근 대화 — 오래된 것부터]\n${lines.join('\n\n') || '(없음)'}\n\n${now}\n\n[상황 조건]\n${JSON.stringify(items)}`;
   }
   // wanted: 열쇠 → 조건 문구. 한 generation에 판정은 한 번이고 3초(SITUATION_TIMEOUT_MS) 안에 끝낸다. 전송과 미리보기가 같은 함수를 쓴다.
@@ -984,7 +1009,7 @@
   }
   // 연결 테스트: 보관함이나 대화에는 손대지 않고, 정해 둔 짧은 예문으로 판정 한 번만 해 본다.
   async function testSituationApi(settings) {
-    const result = await judgeSituations(new Map([['test', 'USER가 인사를 건네는 상황']]), { recent: [], userText: '안녕하세요, 반갑습니다!', event: 'send' }, null, settings);
+    const result = await judgeSituations(new Map([['test', 'USER가 인사를 건네는 상황']]), { recent: [], userText: '안녕하세요, 반갑습니다!', mode: GENERATION_MODES.send }, null, settings);
     return result.info.error ? `실패 · ${result.message || result.info.error}` : `성공 · ${result.info.model} · ${(result.info.ms / 1000).toFixed(1)}초 · 예문 판정 ${result.info.matched ? '일치' : '불일치'}`;
   }
   // 복구 기록은 "어느 방의 어느 메시지에 어떤 generation marker가 남았을 수 있는지"만 담는다.
@@ -1129,7 +1154,7 @@
   }
   function armGeneration(record, socket) {
     const generationId = record.generationId;
-    live.set(generationId, { chatId: record.chatId, state: 'armed', sentAt: Date.now(), lastStreamAt: 0, socket, baselineLatestId: record.baselineLatestId, shared: record.mode === CARRIER_SHARED });
+    live.set(generationId, { chatId: record.chatId, state: 'armed', sentAt: Date.now(), lastStreamAt: 0, socket, baselineAssistantId: record.baselineAssistantId, shared: record.carrierMode === CARRIER_SHARED });
     // 완료·오류 이벤트를 받지 못한 generation은 마지막 스트림 활동 뒤 120초에 정리한다.
     const tick = () => {
       const row = live.get(generationId); if (!row) return;
@@ -1158,17 +1183,18 @@
   // (previewTurn)가 이 함수를 같이 쓴다. 읽기와 판정만 하며 서버의 메시지는 여기서 고치지 않는다.
   async function evaluateTurn(data, turn, signal, api = situationSettings) {
     const { event, recent, frame, userText } = turn;
-    // 글자수 조건의 기준. send는 방금 끝난 직전 AI 응답, reroll은 다시 만들 대상 응답이다. Crack의 reroll payload는
+    // 글자수 조건의 기준은 frame.latest다. send는 방금 끝난 직전 AI 응답, reroll은 다시 만들 대상 응답이다. Crack의 reroll payload는
     // { chatId, freeChatPassCampaignId, instruction }뿐이라 대상 id가 없고 항상 최신 AI 응답을 다시 만든다. 그래서 둘 다
     // 목록의 최신 assistant를 읽되(주입 대상 carrier나 더 오래된 답변이 아니다), 교체되기 전의 본문을 지금 읽어 둔다.
+    // 마지막 USER에 답하는 요청에서는 지워진 답의 길이를 알 수 없다. 추측하지 않고 남아 있는 가장 가까운 이전 답을 쓴다.
     const assistantText = frame.latest ? visibleAssistantText(messageTextOf(frame.latest)) : null;
     await turn.lookup.catalog;
     const room = await turn.lookup.room; await ensureRoomModelKnown(room, signal);
     const model = currentModelContext(turn.payload, recent, room);
-    const request = { reason: event === 'reroll' ? 'before-reroll' : 'before-send', userText, recentText: visibleConversationText(recent), assistantText, model };
+    const request = { reason: `before-${event}`, userText, recentText: visibleConversationText(recent), assistantText, model };
     // 상황 감지: 로컬 조건을 모두 통과한 OOC의 상황 문구만 모아(중복 제거) 한 번에 묻는다. 모을 것이 없으면 요청하지 않는다.
     // 실패·시간 초과는 전부 "해당 없음"이 되어 그 OOC만 빠진다.
-    const wanted = pendingSituations(data, request), judged = wanted.size ? await judgeSituations(wanted, { recent, userText, event }, signal, api) : null;
+    const wanted = pendingSituations(data, request), judged = wanted.size ? await judgeSituations(wanted, { recent, userText, mode: frame.mode }, signal, api) : null;
     if (judged) request.situations = judged.situations;
     const planned = selectAutoOoc(data, request);
     // WRMC가 고를 carrier를 같은 알고리즘으로 예측해 제외하고, 남은 것 중 가장 가까운 안정 assistant를 쓴다.
@@ -1199,11 +1225,13 @@
     const chatId = String(parsed.payload?.chatId || parsed.payload?.data?.chatId || ''); if (!chatId) return skip('no-chat-id');
     const justSent = [...live.values()].filter(row => row.chatId === chatId && row.state === 'armed' && !row.ended && Date.now() - row.sentAt < IN_PROGRESS_GRACE_MS);
     const lookup = startModelLookup(data, chatId, signal);
-    let recent = await fetchRecentMessages(chatId, signal, 50), frame = stableCarrierFrame(recent);
-    if (frame.trailingUser) return skip('trailing-user');
-    // 방금 내보낸 generation이 서버에 아직 반영되지 않았으면(최신 AI 답변이 그대로면) 컨텍스트를 읽기 전일 수 있다.
-    // 그 block은 건드리지 않고 이번 frame만 그대로 보낸다. 최신 답변이 바뀌었으면(완료·중단) 평소처럼 다시 평가한다.
-    if (justSent.some(row => !row.baselineLatestId || row.baselineLatestId === messageIdOf(frame.latest))) return skip('generation-in-progress');
+    let recent = await fetchRecentMessages(chatId, signal, 50), frame = generationFrame(recent, parsed.event);
+    Object.assign(diag, { generationMode: frame.mode, targetUserId: messageIdOf(frame.targetUser) });
+    // 마지막 메시지가 USER라는 것만으로는 건너뛰지 않는다 (그 USER에 답하는 요청일 수 있다). reroll인데 다시 만들 assistant가 없을 때만 다루지 않는다.
+    if (!frame.mode) return skip('trailing-user');
+    // 방금 내보낸 generation이 서버에 아직 반영되지 않았으면(가장 가까운 AI 답변이 그때 그대로면) 컨텍스트를 읽기 전일 수 있다.
+    // 그 block은 건드리지 않고 이번 frame만 그대로 보낸다. 새 답변이 생겼으면(완료·중단) 평소처럼 다시 평가한다.
+    if (justSent.some(row => !row.baselineAssistantId || row.baselineAssistantId === messageIdOf(frame.latest))) return skip('generation-in-progress');
     // B. 이전 generation 잔여물: 복구 기록 → 기록 없는 marker 순서로 정리한다.
     const residues = await cleanupChatResidues(chatId, signal, `before-${parsed.event}`);
     if (!residues.ok) return skip('residue-cleanup-failed');
@@ -1211,14 +1239,17 @@
     if (!stray.ok) return skip('residue-cleanup-failed');
     if (residues.cleaned.length || stray.cleaned.length) {
       diag.recoveryReason = `before-${parsed.event}`;
-      recent = await fetchRecentMessages(chatId, signal, 50); frame = stableCarrierFrame(recent);
-      if (frame.trailingUser) return skip('trailing-user');
+      const before = frame; recent = await fetchRecentMessages(chatId, signal, 50); frame = generationFrame(recent, parsed.event);
+      // 정리하는 사이 대화 구조가 달라졌으면(답할 USER가 지워졌거나 새 메시지가 생겼으면) 처음 본 것과 다른 generation이다.
+      if (frame.mode !== before.mode || messageIdOf(frame.targetUser) !== messageIdOf(before.targetUser)) return skip('generation-target-changed');
     }
-    // C~G. 원래 USER 입력으로 조건을 다시 평가하고 carrier를 고른다. reroll은 서버의 직전 USER 본문을 쓴다.
+    // C~G. 조건을 평가하고 carrier를 고른다. USER 본문의 출처는 generation 형태마다 다르다: 새 USER를 보내는 send는 payload,
+    // 서버에 이미 있는 USER에 답하는 요청은 그 USER 메시지다 (continue의 payload에는 message가 없다). reroll은 서버의 직전 USER.
     const payloadText = parsed.payload?.message ?? parsed.payload?.content ?? parsed.payload?.text;
-    const userTextSource = parsed.event !== 'send' ? 'server-latest-user' : typeof payloadText === 'string' ? 'payload' : 'unknown';
-    const userText = conditionSourceText(userTextSource === 'payload' ? payloadText : userTextSource === 'unknown' ? '' : messageTextOf(frame.latestUser));
-    Object.assign(diag, { userTextSource, assistantSource: !frame.latest ? 'none' : parsed.event === 'reroll' ? 'reroll-target' : 'latest', assistantMessageId: messageIdOf(frame.latest) });
+    const userTextSource = frame.mode === GENERATION_MODES.answer ? 'server-trailing-user' : frame.mode !== GENERATION_MODES.send ? 'server-latest-user' : typeof payloadText === 'string' ? 'payload' : 'unknown';
+    const userText = conditionSourceText(userTextSource === 'payload' ? payloadText : userTextSource === 'unknown' ? '' : messageTextOf(frame.latestUser)), targetUserText = messageTextOf(frame.targetUser);
+    Object.assign(diag, { userTextSource, assistantMessageId: messageIdOf(frame.latest),
+      assistantSource: !frame.latest ? 'none' : frame.trailingUser ? 'previous-assistant-before-trailing-user' : frame.mode === GENERATION_MODES.reroll ? 'reroll-target' : 'latest' });
     const { request, model, assistantText, judged, planned, wish, choice } = await evaluateTurn(data, { event: parsed.event, payload: parsed.payload, recent, frame, userText, lookup }, signal);
     if (judged) diag.situation = judged.info;
     Object.assign(diag, { assistantChars: assistantText === null ? null : assistantText.length, userChars: userText.length, modelDetected: planned.modelDetected, matched: planned.matched, selected: planned.selected, omitted: planned.omitted, bundleChars: planned.chars });
@@ -1228,7 +1259,7 @@
       carriersSeparated: choice.mode === CARRIER_SEPARATE && choice.carrierId !== choice.predictedWishId, rejectedCarriers: choice.rejected });
     if (!choice.carrier) return skip('no-independent-carrier');
     const generationId = (crypto.randomUUID?.() || `${Date.now()}_${Math.random().toString(36).slice(2)}`).replace(/[^A-Za-z0-9_-]/g, '_');
-    const record = { chatId, messageId: choice.carrierId, generationId, event: parsed.event, at: Date.now(), patched: false, journaled: false, baselineLatestId: messageIdOf(frame.latest), mode: choice.mode, retries: 0 };
+    const record = { chatId, messageId: choice.carrierId, generationId, event: parsed.event, at: Date.now(), patched: false, journaled: false, generationMode: frame.mode, targetUserId: messageIdOf(frame.targetUser), baselineAssistantId: messageIdOf(frame.latest), carrierMode: choice.mode, retries: 0 };
     diag.generationId = generationId; diagnosticsById.set(generationId, diag);
     live.set(generationId, { chatId, state: 'preparing', sentAt: 0, lastStreamAt: 0, socket });
     try {
@@ -1247,9 +1278,12 @@
           async guard() {
             if (currentChatId() !== chatId) throw skipInjection('chat-changed');
             if (socket && socket.readyState !== 1) throw skipInjection('socket-not-open');
-            const now = stableCarrierFrame(await fetchRecentMessages(chatId, signal, 30));
+            const now = generationFrame(await fetchRecentMessages(chatId, signal, 30), parsed.event);
+            // 처음 본 것과 같은 generation인지: 형태가 같고, 답할 USER가 그대로 마지막에 있으며 내용도 같아야 한다.
+            if (now.mode !== frame.mode || messageIdOf(now.targetUser) !== record.targetUserId || messageTextOf(now.targetUser) !== targetUserText) throw skipInjection('generation-target-changed');
             const again = selectAutoCarrier(now, wish.separate || detectWish(data, now.messages).separate);
-            if (now.trailingUser || messageIdOf(now.latest) === record.messageId || again.carrierId !== record.messageId || again.mode !== choice.mode) throw skipInjection('carrier-changed');
+            // 마지막이 assistant인 구조에서는 그 최신 답(방금 끝났거나 다시 만들 대상)이 carrier가 되어 있으면 안 된다.
+            if (!now.trailingUser && messageIdOf(now.latest) === record.messageId || again.carrierId !== record.messageId || again.mode !== choice.mode) throw skipInjection('carrier-changed');
           },
           // 복구 기록을 PATCH보다 먼저 남긴다. PATCH 응답을 못 받아도 잔여물 위치를 잃지 않는다.
           beforePatch() { record.journaled = true; rememberResidue(record); },
@@ -1275,16 +1309,20 @@
   // PATCH, 복구 기록, live 등록, cleanup을 하지 않는다. carrier에 예전 AUTO 구간이 남아 있어도 지우지 않고 계산에서만 뺀다
   // (실제 전송은 보내기 전에 지운다). generation id 자리에는 실제로 쓰이지 않는 PREVIEW_GENERATION_ID가 들어간다.
   async function previewTurn(data, api = situationSettings) {
-    const editor = document.querySelector('.__chat_input_textarea[contenteditable="true"]');
-    const shown = { chatId: currentChatId(), userText: conditionSourceText(editor?.innerText ?? editor?.textContent ?? ''), reason: '', error: '', turn: null, carrier: null, maxChars: normalizeSettings(data.autoSettings).autoOocMaxChars };
+    const editor = document.querySelector('.__chat_input_textarea[contenteditable="true"]'), composer = conditionSourceText(editor?.innerText ?? editor?.textContent ?? '');
+    const shown = { chatId: currentChatId(), userText: composer, userTextSource: 'composer', generationMode: '', targetUserId: '', reason: '', error: '', turn: null, carrier: null, maxChars: normalizeSettings(data.autoSettings).autoOocMaxChars };
     const stop = (reason, error = '') => Object.assign(shown, { reason, error });
     if (!autoActive(data)) return stop('auto-ooc-off');
     if (!shown.chatId) return stop('no-chat');
     const controller = new PageAbortController(), timer = setTimeout(() => controller.abort(), PREPARE_TIMEOUT_MS), signal = controller.signal;
     try {
-      const lookup = startModelLookup(data, shown.chatId, signal), recent = await fetchRecentMessages(shown.chatId, signal, 50), frame = stableCarrierFrame(recent);
-      if (frame.trailingUser) return stop('trailing-user');
-      const turn = shown.turn = await evaluateTurn(data, { event: 'send', payload: null, recent, frame, userText: shown.userText, lookup }, signal, api);
+      const lookup = startModelLookup(data, shown.chatId, signal), recent = await fetchRecentMessages(shown.chatId, signal, 50);
+      // 서버의 마지막이 답 없는 USER이고 입력창이 비어 있으면, 지금 할 수 있는 것은 그 USER에 답하는 "이어서 생성"이다 (Crack도 빈 입력이면 continue를 보낸다).
+      // 조건은 그 USER 메시지로 판정한다. 입력창에 글이 있으면 그 글을 새로 보내는 것으로 본다.
+      let event = 'send', frame = generationFrame(recent, event);
+      if (frame.trailingUser && !composer.trim()) { event = 'continue'; frame = generationFrame(recent, event); Object.assign(shown, { userText: conditionSourceText(messageTextOf(frame.targetUser)), userTextSource: 'server-trailing-user' }); }
+      Object.assign(shown, { generationMode: frame.mode, targetUserId: messageIdOf(frame.targetUser) });
+      const turn = shown.turn = await evaluateTurn(data, { event, payload: null, recent, frame, userText: shown.userText, lookup }, signal, api);
       if (!turn.planned.block) return stop(turn.planned.matched.length ? 'over-budget' : 'no-matching-ooc');
       if (!turn.choice.carrier) return stop(!frame.stable.length ? 'no-stable-assistant' : turn.choice.rejected.every(row => row.reason === 'empty-body') ? 'carrier-empty' : 'no-independent-carrier');
       const message = await fetchCarrierMessage(shown.chatId, turn.choice.carrierId, signal);
@@ -1347,7 +1385,7 @@
       const parsed = parseSocketFrame(data), chatId = String(parsed?.payload?.chatId || parsed?.payload?.data?.chatId || '');
       // 사용자가 생성을 멈추면 Crack은 { chatId }만 담은 stop을 보낸다. frame은 그대로 넘기고, 남은 block은 잠시 뒤 정리한다.
       if (parsed?.event === 'stop' && chatId) endGenerations('generation-stopped', row => String(row.chatId) === chatId, 1000);
-      if (!parsed || !['send', 'reroll'].includes(parsed.event) || !chatId || chatId !== currentChatId()) return previousSend.call(this, data);
+      if (!parsed || !GENERATION_EVENTS.includes(parsed.event) || !chatId || chatId !== currentChatId()) return previousSend.call(this, data);
       if (library && !autoActive(library)) return previousSend.call(this, data);
       // 가로챈 frame은 어떤 경우에도 버리지 않는다. 같은 방의 frame은 들어온 순서대로 내보내고,
       // 앞선 generation이 진행 중이면 뒤 frame은 자동 OOC 없이 그대로 넘긴다 (block은 generation당 하나).
@@ -1388,7 +1426,7 @@
     Object.defineProperty(W, '__CRACK_OOC_LIBRARY_TEST_API__', { configurable: true, value: {
       check, transport, selectAutoOoc: (data, request) => selectAutoOoc(check(data), request), stableCarrierFrame, selectAutoCarrier, detectWish, removeAutoRegions, countAutoRegions, autoRegion, autoRegionOverhead,
       conditionSourceText, cleanupAutoRecord, cleanupChatResidues, injectAutoOoc, markerPattern, fitBundleForCarrier, loadResidues, diagnostics: autoDiagnostics, hookInfo, live,
-      composeCarrier, previewTurn: (data, api) => previewTurn(check(data), api), PREVIEW_GENERATION_ID, fresh, normalizeAuto, normalizeSettings, readLibrary,
+      composeCarrier, previewTurn: (data, api) => previewTurn(check(data), api), PREVIEW_GENERATION_ID, fresh, normalizeAuto, normalizeSettings, readLibrary, generationFrame, GENERATION_MODES, GENERATION_EVENTS,
       modelOptions, legacyModelKey, refreshModelCatalog, currentModelContext, visibleAssistantText,
       parseFirebaseAppConfig, normalizeSituationSettings, saveSituationSettings, judgeSituations, parseMatchedIds, pendingSituations: (data, request) => pendingSituations(check(data), request),
       testSituationApi, situationPrompt, diagnosticsText, SITUATION_MODELS, SITUATION_CONTEXT_MESSAGES, SITUATION_TIMEOUT_MS,
@@ -1608,7 +1646,6 @@
   const PREVIEW_REASONS = {
     'auto-ooc-off': '자동 OOC가 꺼져 있거나 자동주입을 켠 OOC가 없습니다.',
     'no-chat': '채팅방 화면이 아니어서 확인할 대화가 없습니다.',
-    'trailing-user': '마지막 메시지가 아직 답을 받지 못한 USER 입력입니다. 이런 턴은 자동 OOC를 건너뜁니다.',
     'no-matching-ooc': '지금 조건에 맞는 OOC가 없습니다.',
     'over-budget': '조건에 맞는 OOC가 있지만 최대 글자수 안에 하나도 들어가지 않습니다.',
     'no-stable-assistant': '붙일 수 있는 과거 AI 답변이 아직 없습니다. 최신 AI 답변과 그 앞의 USER 입력보다 오래된 AI 답변이 있어야 합니다.',
@@ -1618,6 +1655,10 @@
     'carrier-auto-damaged': '붙일 과거 AI 답변에 짝이 맞지 않는 AUTO marker가 남아 있어 건드리지 않습니다.',
     'carrier-missing': '붙일 과거 AI 답변을 서버에서 찾지 못했습니다.',
     'lookup-failed': '대화를 조회하지 못했습니다.',
+  };
+  const PREVIEW_MODES = {
+    [GENERATION_MODES.send]: '새 USER 입력을 전송',
+    [GENERATION_MODES.answer]: '마지막 USER에 이어서 답변 (이어서 생성)',
   };
   async function copyText(text, shownIn) {
     try { await navigator.clipboard.writeText(text); return; } catch { /* 클립보드 권한이 없으면 선택 복사로 넘어간다. */ }
@@ -1638,6 +1679,7 @@
     if (overBudget.length) line(`한도 때문에 제외: ${overBudget.map(item => item.name).join(', ')}`);
     if (turn) {
       const judged = turn.judged, model = turn.model;
+      line(`생성 방식: ${PREVIEW_MODES[shown.generationMode] || shown.generationMode}${shown.targetUserId ? ` · ${shown.userTextSource === 'server-trailing-user' ? '대상 USER' : '답 없는 USER 뒤에 보냄'}: 메시지 ${shown.targetUserId}` : ''}`);
       if (judged) line(judged.info.error ? `상황 감지 실패(${judged.message || judged.info.error}) → 상황 조건이 든 OOC는 빠집니다.` : `상황 감지: 조건 ${judged.info.conditions}개 중 ${judged.info.matched}개 해당 (${(judged.info.ms / 1000).toFixed(1)}초)`);
       else if (uses('situation')) line('상황 감지: 다른 조건에서 먼저 걸러져 이번에는 API에 묻지 않습니다.');
       if (uses('assistantLength')) line(typeof turn.assistantText === 'string' ? `직전 AI 응답: ${count(turn.assistantText.length)}자` : '직전 AI 응답을 찾지 못해 글자수 조건 OOC는 빠집니다.');
@@ -1656,9 +1698,10 @@
       root.append(details);
     }
     if (shown.chatId) {
-      const details = node('details', 'oa-raw');
-      details.append(node('summary', '', '현재 USER 입력'), node('p', 'oa-raw-stats', shown.userText ? `${count(shown.userText.length)}자 · 입력창의 글은 고치지 않고 그대로 전송됩니다.` : '입력창이 비어 있습니다. 조건은 빈 입력으로 판정했습니다.'));
-      if (shown.userText) details.append(rawBox('현재 USER 입력', shown.userText, 4));
+      const details = node('details', 'oa-raw'), fromServer = shown.userTextSource === 'server-trailing-user', title = fromServer ? '답할 USER 메시지 (서버)' : '현재 USER 입력';
+      details.append(node('summary', '', title), node('p', 'oa-raw-stats', fromServer ? `${count(shown.userText.length)}자 · 서버에 남아 있는 마지막 USER 메시지입니다. 조건은 이 글로 판정했고, 이 메시지는 고치지 않습니다.`
+        : shown.userText ? `${count(shown.userText.length)}자 · 입력창의 글은 고치지 않고 그대로 전송됩니다.` : '입력창이 비어 있습니다. 조건은 빈 입력으로 판정했습니다.'));
+      if (shown.userText) details.append(rawBox(title, shown.userText, 4));
       root.append(details);
     }
   }
