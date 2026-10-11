@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Crack OOC 보관함
 // @namespace    crack.ooc.library
-// @version      3.0.3.1
+// @version      3.0.3.2
 // @description  OOC를 보관하고 안전한 assistant carrier에 독립적으로 자동 컨텍스트를 주입 (version 관리방식: 데이터구조버전.크랙UI변경.기능추가및수정.버그수정)
 // @match        https://crack.wrtn.ai/*
 // @noframes
@@ -56,6 +56,8 @@
  * - 함께 쓸 답변도 없거나 어떤 단계든 실패하면 그 generation의 자동 OOC만 건너뛰고 원래 전송은 그대로 보낸다.
  * - 3.0.3.0: 상황 감지는 입력하는 동안 미리 받아 둔다. 새 USER를 보내는 전송은 그 결과만 쓰고 전송 시점에 API를 부르지 않는다.
  *   입력 상자 위의 "이번 턴 OOC"에서 이번 턴에만 넣고 뺄 수 있다 (메모리에만 두며 자료에 저장하지 않는다).
+ * - 3.0.3.2: Crack의 select_chat_mode_btn 추적 이벤트를 읽어 방별 현재 모델 key를 직접 기억한다. 이 값은 모델 조건의 최우선
+ *   출처이며 모델 변경 직후 체크리스트와 전송 판정에 바로 쓰고, 방 API·화면·메시지는 이벤트가 없을 때만 fallback으로 쓴다.
  * - 3.0.2.1: generation 요청은 send / reroll / continue("이어서 생성") 셋이다. 서버의 마지막 메시지가 USER인 채로 오는 continue는
  *   그 USER에 답하는 정상 요청이다 (답을 지우고 다시 만들 때). 이때는 남아 있는 과거 AI 답변이 모두 carrier 후보다.
  * - hook 설치 순서(WRMC/에리 wrapper의 안쪽·바깥쪽)는 동작 조건이 아니다. 실제 위치는 진단에만 표시한다.
@@ -127,10 +129,15 @@
   // generationId → { chatId, state: 'preparing' | 'armed', sentAt, lastStreamAt, socket }
   const live = new Map(), carrierLocks = new Map(), cleanupRunning = new Map();
   const autoDiagnostics = [], diagnosticsById = new Map();
-  const hookInfo = { installed: false, position: '', wishWrapper: false };
+  const hookInfo = { installed: false, position: '', wishWrapper: false, chatModeFetch: false };
+  // select_chat_mode_btn으로 직접 확인한 값은 방별 메모리에만 둔다. 같은 페이지에서 방을 오가더라도 서로 섞지 않고,
+  // localStorage/Firebase에는 쓰지 않는다. 중복 주입된 스크립트도 같은 fetch hook의 감지값을 보게 한다.
+  const detectedModels = W.__CRACK_OOC_LIBRARY_DETECTED_MODELS__ instanceof Map ? W.__CRACK_OOC_LIBRARY_DETECTED_MODELS__ : new Map();
+  try { if (!W.__CRACK_OOC_LIBRARY_DETECTED_MODELS__) Object.defineProperty(W, '__CRACK_OOC_LIBRARY_DETECTED_MODELS__', { value: detectedModels, configurable: true }); } catch {}
   const dropAreas = new WeakMap();
   try { settings = JSON.parse(pageStorage.getItem(STORAGE_KEY)) || settings; } catch { /* 설정이 없거나 손상되었으면 로컬로 시작한다. */ }
   installStandaloneInjector();
+  installChatModeFetchHook();
 
   function stableId(text) {
     let hash = 2166136261;
@@ -480,16 +487,17 @@
   }
   // 방의 chatModelId(_id)나 crackerModel만 알아도 목록으로 나머지 식별값을 채운다.
   function resolveModel(context) {
-    const out = { crackerModel: '', chatModelId: '', model: '', label: '', name: '', source: '', ...(context && typeof context === 'object' ? context : {}) };
+    const out = { crackerModel: '', chatModelId: '', model: '', label: '', name: '', source: '', detectedEventKey: '', resolvedKey: '', ...(context && typeof context === 'object' ? context : {}) };
     const byId = out.chatModelId && modelCatalog.find(row => row.id === String(out.chatModelId));
     if (byId) { if (!out.crackerModel) out.crackerModel = byId.key; if (!out.name) out.name = byId.name; }
     const byKey = out.crackerModel && modelCatalog.find(row => modelText(row.key) === modelText(out.crackerModel));
     if (byKey && !out.name) out.name = byKey.name;
+    if (!out.resolvedKey && out.crackerModel) out.resolvedKey = byKey?.key || String(out.crackerModel);
     return out;
   }
   function modelValues(model) {
     const source = model && typeof model === 'object' ? model : {};
-    return [...new Set([source.crackerModel, source.chatModelId, source.model, source.label, source.name].map(modelText).filter(Boolean))];
+    return [...new Set([source.resolvedKey, source.detectedEventKey, source.crackerModel, source.chatModelId, source.model, source.label, source.name].map(modelText).filter(Boolean))];
   }
   function catalogKnows(model) {
     const values = modelValues(model);
@@ -499,10 +507,23 @@
   // 그 이름을 가진 key가 목록에 하나뿐일 때만 그 key로 본다. 이름이 같은 다른 모델이 있으면 어느 쪽인지 알 수 없으므로 정하지 않는다.
   function modelKeysOf(model) {
     const source = resolveModel(model), direct = modelText(source.crackerModel);
+    if (source.resolvedKey) return [modelText(source.resolvedKey)];
     if (direct) return [direct];
+    const byId = source.chatModelId && modelCatalog.find(row => row.id === String(source.chatModelId));
+    if (byId) return [modelText(byId.key)];
     const names = [source.name, source.label, source.model].map(modelText).filter(Boolean);
     const keys = [...new Set(modelCatalog.filter(row => names.includes(modelText(row.name)) || names.includes(modelText(row.key))).map(row => modelText(row.key)))];
     return keys.length === 1 ? keys : [];
+  }
+  function detectedModelForChat(chatId) {
+    const detected = detectedModels.get(String(chatId || ''));
+    if (!detected?.key) return null;
+    // select_chat_mode_btn의 chat_mode는 Crack의 crackerModel key namespace다. 혹시 catalog _id가 내려오는 변화가 생기면
+    // 표시명 추측 없이 id의 정확한 행으로만 key를 바꾼다.
+    const byId = modelCatalog.find(row => row.id === detected.key), byKey = modelCatalog.find(row => modelText(row.key) === modelText(detected.key));
+    const resolvedKey = byId?.key || byKey?.key || detected.key;
+    return resolveModel({ crackerModel: resolvedKey, chatModelId: byId ? detected.key : '', detectedEventKey: detected.key, resolvedKey,
+      name: (byId || byKey)?.name || '', source: detected.source || 'select_chat_mode_btn' });
   }
   // 상황 조건 문구를 비교·중복 제거할 때 쓰는 열쇠. 같은 문구를 여러 OOC가 쓰면 API에는 한 번만 묻고 결과를 함께 쓴다.
   const situationKey = text => String(text ?? '').normalize('NFKC').replace(/\s+/g, ' ').trim().toLocaleLowerCase();
@@ -562,7 +583,7 @@
     const configured = normalizeSettings(data.autoSettings), requested = Number(request.maxChars);
     const maxChars = Math.max(0, Math.min(configured.autoOocMaxChars, Number.isFinite(requested) ? Math.trunc(requested) : configured.autoOocMaxChars));
     const overhead = Number.isFinite(Number(request.overhead)) ? Math.max(0, Number(request.overhead)) : autoRegionOverhead();
-    const modelDetected = modelValues(request.model).length > 0;
+    const modelDetected = modelKeysOf(request.model).length > 0;
     if (!configured.autoInjectionEnabled || !GENERATION_EVENTS.some(event => request.reason === `before-${event}`) || maxChars <= 0) return { block: '', selected: [], matched: [], omitted: [], maxChars, chars: 0, modelDetected };
     // request.overrides(OOC id → 넣음/뺌)는 사용자가 이번 턴에만 직접 정한 값이다. 있으면 조건 판정 대신 그 값을 쓴다. 순서와 글자수 예산은 그대로다.
     const forced = request.overrides instanceof Map ? request.overrides : null;
@@ -609,6 +630,53 @@
       const match = String(pathname).match(pattern); if (match) return match[1];
     }
     return '';
+  }
+  function rememberDetectedModel(chatId, key) {
+    const normalizedChatId = String(chatId || '').trim(), normalizedKey = String(key || '').trim();
+    if (!normalizedChatId || !normalizedKey) return null;
+    const detected = { chatId: normalizedChatId, key: normalizedKey, detectedAt: Date.now(), source: 'select_chat_mode_btn' };
+    detectedModels.set(normalizedChatId, detected);
+    if (normalizedChatId !== currentChatId()) return detected;
+    // 같은 방의 화면은 기존 room/model cache를 버리고 event key로 즉시 다시 그린다. 상황 조건 API는 여기서 호출하지 않고
+    // 기존 입력 debounce를 거쳐 새 대상만 prefetch한다. 같은 방의 manual override는 그대로 둔다.
+    if (turnOoc.chatId !== normalizedChatId) resetTurn(normalizedChatId);
+    turnOoc.context = null; turnOoc.contextEpoch++; turnOoc.run++;
+    if (turnOoc.view) {
+      turnOoc.view.request = { ...turnOoc.view.request, model: detectedModelForChat(normalizedChatId) };
+      drawTurn();
+    }
+    scheduleTurn('select-chat-mode');
+    return detected;
+  }
+  const fetchUrlOf = resource => typeof resource === 'string' ? resource : String(resource?.url || '');
+  function inspectChatModeTrack(resource, config) {
+    const url = fetchUrlOf(resource); if (!url.includes('event-gateway.wrtn.ai/v1/track')) return;
+    const inspect = bodyText => {
+      if (!bodyText || !String(bodyText).includes('select_chat_mode_btn')) return;
+      try {
+        const event = JSON.parse(String(bodyText)); if (event?.eventName !== 'select_chat_mode_btn') return;
+        const properties = event?.eventProperties || {};
+        rememberDetectedModel(properties.chat_id || currentChatId(), properties.chat_mode);
+      } catch (error) { console.info('[Crack OOC 보관함] 채팅 모드 선택 이벤트를 읽지 못했습니다.', error); }
+    };
+    const body = config?.body;
+    if (typeof body === 'string') { inspect(body); return; }
+    if (typeof W.URLSearchParams === 'function' && body instanceof W.URLSearchParams) { inspect(body.toString()); return; }
+    if (body && typeof body.text === 'function') { void body.text().then(inspect, () => {}); return; }
+    if (typeof W.Request === 'function' && resource instanceof W.Request) { void resource.clone().text().then(inspect, () => {}); }
+  }
+  function installChatModeFetchHook() {
+    const originalFetch = W.fetch; if (typeof originalFetch !== 'function') return;
+    if (W.__CRACK_OOC_LIBRARY_CHAT_MODE_FETCH_HOOK__) { hookInfo.chatModeFetch = true; return; }
+    try { Object.defineProperty(W, '__CRACK_OOC_LIBRARY_CHAT_MODE_FETCH_HOOK__', { value: true, configurable: true }); } catch {}
+    function crackOocFetch(...args) {
+      // 원래 요청을 먼저 그대로 시작하고, 같은 인자에서 body를 읽기만 한다. 반환값·URL·body·응답은 바꾸거나 막지 않는다.
+      const response = originalFetch.apply(this, args);
+      try { inspectChatModeTrack(args[0], args[1]); } catch (error) { console.info('[Crack OOC 보관함] 채팅 모드 선택 감지 실패', error); }
+      return response;
+    }
+    crackOocFetch.__crackOocLibraryChatModeHook = true;
+    W.fetch = crackOocFetch; hookInfo.chatModeFetch = true;
   }
   function stableCarrierFrame(newestFirst) {
     const messages = (newestFirst || []).filter(message => ['user', 'assistant'].includes(messageRoleOf(message)));
@@ -794,21 +862,25 @@
     return { crackerModel: text(room.crackerModel), chatModelId: text(room.chatModelId), model: text(room.model) };
   }
   // 한 출처만 쓴다. 여러 출처를 섞으면 모델을 바꾼 직후 예전 모델 조건까지 맞아 버린다.
-  // 방 정보 → 화면의 모델 버튼 → 직전 AI 답변 → 페이지 로드 때의 metadata 순서이며 (Crack의 send/reroll payload에는 모델 값이 없다),
+  // 같은 방의 select_chat_mode_btn → 방 정보 → 화면의 모델 버튼 → 직전 AI 답변 → 페이지 로드 때의 metadata 순서이며
+  // (Crack의 send/reroll payload에는 모델 값이 없다),
   // 아무 곳에서도 못 찾으면 빈 값이 되어 모델 조건 OOC만 빠진다.
-  function currentModelContext(payload, messages = [], room = null) {
+  function currentModelContext(payload, messages = [], room = null, chatIdOverride = '') {
     const fields = source => {
       const pick = (...keys) => { for (const key of keys) if (typeof source?.[key] === 'string' && source[key].trim()) return source[key].trim(); return ''; };
       return { crackerModel: pick('crackerModel', 'cracker_model'), chatModelId: pick('chatModelId', 'chat_model_id'), model: pick('model', 'modelId', 'model_id', 'engine'), label: pick('modelName', 'modelLabel', 'crackerModelName') };
     };
     const known = context => Object.values(context).some(Boolean);
+    const chatId = String(chatIdOverride || payload?.chatId || payload?.data?.chatId || currentChatId());
+    const detected = detectedModelForChat(chatId);
+    if (detected) return detected;
     const tiers = [
       ['room', () => fields(room)],
       ['model-button', () => ({ ...fields(null), label: semanticModelLabel() })],
       ['last-assistant', () => fields((messages || []).find(message => messageRoleOf(message) === 'assistant'))],
       ['page-metadata', () => {
         const script = document.querySelector('#__NEXT_DATA__'), state = script ? JSON.parse(script.textContent || '{}') : null;
-        const chatId = String(payload?.chatId || payload?.data?.chatId || currentChatId()), fallback = state?.props?.pageProps?.fallback || {};
+        const fallback = state?.props?.pageProps?.fallback || {};
         return fields(fallback[`/v3/chats/${chatId}`]?.data || Object.values(fallback).find(value => String(value?.data?._id || value?.data?.id || '') === chatId)?.data);
       }],
     ];
@@ -819,7 +891,7 @@
       try {
         const context = read(); if (!known(context)) continue;
         const resolved = resolveModel({ ...context, source });
-        if (catalogKnows(resolved)) return resolved;
+        if (modelKeysOf(resolved).length) return resolved;
         if (!unconfirmed) unconfirmed = resolved;
       } catch { /* 다음 출처로 넘어간다. */ }
     }
@@ -1208,8 +1280,8 @@
   // { chatId, freeChatPassCampaignId, instruction }뿐이라 대상 id가 없고 항상 최신 AI 응답을 다시 만든다. 그래서 둘 다
   // 목록의 최신 assistant를 읽되(주입 대상 carrier나 더 오래된 답변이 아니다), 교체되기 전의 본문을 지금 읽어 둔다.
   // 마지막 USER에 답하는 요청에서는 지워진 답의 길이를 알 수 없다. 추측하지 않고 남아 있는 가장 가까운 이전 답을 쓴다.
-  function turnRequest(event, payload, recent, frame, userText, room) {
-    return { reason: `before-${event}`, userText, recentText: visibleConversationText(recent), assistantText: frame.latest ? visibleAssistantText(messageTextOf(frame.latest)) : null, model: currentModelContext(payload, recent, room) };
+  function turnRequest(event, payload, recent, frame, userText, room, chatId = '') {
+    return { reason: `before-${event}`, userText, recentText: visibleConversationText(recent), assistantText: frame.latest ? visibleAssistantText(messageTextOf(frame.latest)) : null, model: currentModelContext(payload, recent, room, chatId) };
   }
   // 이번 턴의 판정 한 벌: 조건 평가 → 상황 판정 → 직접 바꾼 선택 → OOC 선택 → carrier 선택. 실제 전송(injectAutoOoc)과 설정의 "현재 턴 미리보기"
   // (previewTurn)가 이 함수를 같이 쓴다. 읽기와 판정만 하며 서버의 메시지는 여기서 고치지 않는다.
@@ -1218,7 +1290,7 @@
     await turn.lookup.catalog;
     const room = await turn.lookup.room; await ensureRoomModelKnown(room, signal);
     // 모델·글자수·키워드 조건은 언제나 지금 값으로 계산한다 (입력한 뒤에 모델을 바꿨을 수 있다). 미리 받아 두는 것은 상황 판정뿐이다.
-    const request = turnRequest(event, turn.payload, recent, frame, userText, room), { assistantText, model } = request;
+    const request = turnRequest(event, turn.payload, recent, frame, userText, room, turn.chatId), { assistantText, model } = request;
     // 상황 감지: 로컬 조건을 모두 통과한 OOC의 상황 문구만 대상이다 (중복 제거). 실패는 전부 "해당 없음"이 되어 그 OOC만 빠진다.
     // - 새 USER를 보내는 전송: 입력하는 동안 미리 받아 둔 판정만 쓴다. 여기서 API를 부르거나 기다리지 않는다. 받아 둔 것이 없는 문구는 거짓이다.
     // - 리롤·이어서 생성: 입력창에 글이 없는 요청이다. 같은 대화로 받아 둔 판정이 있으면 쓰고, 없으면 지금 한 번 묻는다.
@@ -1245,7 +1317,7 @@
   // - key: 받아 둔(또는 받는 중인) 판정이 어떤 입력에 대한 것인지. 같은 key면 다시 묻지 않는다.
   const EMPTY_TURN_PLAN = Object.freeze({ chatId: '', key: '', status: 'idle', situations: new Map(), overrides: new Map(), info: null, message: '' });
   const turnOoc = { chatId: '', draft: '', overrides: new Map(), situations: new Map(), key: '', status: 'idle', info: null, message: '', pending: null, abort: null,
-    context: null, view: null, timer: null, run: 0, generatingAt: 0, toasted: '', errorShown: false, watching: false, open: false, seenRaw: null, modelLabel: null };
+    context: null, contextEpoch: 0, view: null, timer: null, run: 0, generatingAt: 0, toasted: '', errorShown: false, watching: false, open: false, seenRaw: null, modelLabel: null };
   const toastLog = [];
   const composerEditor = () => document.querySelector('.__chat_input_textarea[contenteditable="true"]');
   const composerText = () => { const editor = composerEditor(); return conditionSourceText(editor?.innerText ?? editor?.textContent ?? ''); };
@@ -1276,7 +1348,7 @@
   }
   function resetTurn(chatId = currentChatId()) {
     clearTurnJudgement(); turnOoc.overrides.clear();
-    Object.assign(turnOoc, { chatId, draft: '', context: null, view: null, generatingAt: 0, toasted: '', errorShown: false });
+    Object.assign(turnOoc, { chatId, draft: '', context: null, contextEpoch: turnOoc.contextEpoch + 1, view: null, generatingAt: 0, toasted: '', errorShown: false });
   }
   const peekTurnPlan = chatId => turnOoc.chatId !== chatId ? EMPTY_TURN_PLAN
     : { chatId, key: turnOoc.key, status: turnOoc.status, situations: new Map(turnOoc.situations), overrides: new Map(turnOoc.overrides), info: turnOoc.info, message: turnOoc.message };
@@ -1301,11 +1373,14 @@
     const cached = turnOoc.context;
     if (cached && cached.chatId === chatId && Date.now() - cached.at < TURN_CONTEXT_MAX_AGE_MS) return cached;
     if (!allEntries(data).some(entry => entry.autoInjection.enabled && entry.autoInjection.conditions.length)) return { chatId, recent: [], room: null, at: 0 };
+    const epoch = turnOoc.contextEpoch;
     const controller = new PageAbortController(), timer = setTimeout(() => controller.abort(), PREPARE_TIMEOUT_MS);
     try {
       const lookup = startModelLookup(data, chatId, controller.signal), recent = await fetchRecentMessages(chatId, controller.signal, 50);
       await lookup.catalog; const room = await lookup.room; await ensureRoomModelKnown(room, controller.signal);
-      return turnOoc.context = { chatId, recent, room, at: Date.now() };
+      const context = { chatId, recent, room, at: Date.now() };
+      if (turnOoc.chatId === chatId && turnOoc.contextEpoch === epoch) turnOoc.context = context;
+      return context;
     } finally { clearTimeout(timer); }
   }
   // 지금 입력을 기준으로 이번 턴 OOC를 다시 계산한다. 로컬 조건은 바로 계산하고, 상황 조건은 필요한 문구만 모아 한 번 묻는다.
@@ -1321,7 +1396,7 @@
     let context = null;
     try { context = await turnContext(chatId, data); } catch (error) { console.info('[Crack OOC 보관함] 이번 턴 OOC: 최근 대화를 읽지 못했습니다.', error); }
     if (run !== turnOoc.run || chatId !== currentChatId()) return;
-    const recent = context?.recent || [], draft = draftTurn(recent, composer), request = turnRequest(draft.event, null, recent, draft.frame, draft.userText, context?.room || null);
+    const recent = context?.recent || [], draft = draftTurn(recent, composer), request = turnRequest(draft.event, null, recent, draft.frame, draft.userText, context?.room || null, chatId);
     turnOoc.view = { data, request, mode: draft.frame.mode };
     // 미리 묻는 것은 상황 판정뿐이다. 보낼 글이 없거나(빈 입력창), 응답을 만드는 중이거나, 대화를 읽지 못했으면 묻지 않는다.
     const wanted = pendingSituations(data, request);
@@ -1444,7 +1519,7 @@
     if (chatId !== turnOoc.chatId) { resetTurn(chatId); turnOoc.seenRaw = raw; turnOoc.modelLabel = label; drawTurn(); scheduleTurn('chat', 300); return; }
     // 모델을 바꾸면 Crack이 방의 chatModelId를 고친다. 기억해 둔 방 정보를 버리고 체크리스트를 다시 계산한다.
     // 모델+상황 조건처럼 물어볼 문구 자체가 달라지면 상황 판정도 새로 받는다. 직접 바꾼 선택은 건드리지 않는다.
-    if (label !== turnOoc.modelLabel) { const first = turnOoc.modelLabel === null; turnOoc.modelLabel = label; if (!first) { turnOoc.context = null; scheduleTurn('model'); } }
+    if (label !== turnOoc.modelLabel) { const first = turnOoc.modelLabel === null; turnOoc.modelLabel = label; if (!first) { turnOoc.context = null; turnOoc.contextEpoch++; scheduleTurn('model'); } }
     if (raw !== turnOoc.seenRaw) { turnOoc.seenRaw = raw; scheduleTurn('draft'); }
   }
   function startTurnUi() {
@@ -1507,7 +1582,8 @@
     const { request, model, assistantText, judged, planned, wish, choice } = await evaluateTurn(data, { event: parsed.event, chatId, payload: parsed.payload, recent, frame, userText, lookup, plan }, signal);
     if (judged) diag.situation = judged.info;
     Object.assign(diag, { assistantChars: assistantText === null ? null : assistantText.length, userChars: userText.length, modelDetected: planned.modelDetected, matched: planned.matched, selected: planned.selected, omitted: planned.omitted, bundleChars: planned.chars });
-    if (lookup.needed) diag.model = { source: model.source, crackerModel: model.crackerModel, chatModelId: model.chatModelId, name: model.name || model.label };
+    if (lookup.needed) diag.model = { source: model.source, detectedEventKey: model.detectedEventKey || '', crackerModel: model.crackerModel || '', chatModelId: model.chatModelId || '',
+      resolvedKey: model.resolvedKey || modelKeysOf(model)[0] || '', name: model.name || model.label || '' };
     if (!planned.block) return skip(planned.matched.length ? 'over-budget' : 'no-matching-ooc');
     Object.assign(diag, { wrmc: { mode: wish.mode, signals: wish.signals, separate: wish.separate }, predictedWrmcCarrierId: choice.predictedWishId, carrierId: choice.carrierId, carrierMode: choice.mode,
       carriersSeparated: choice.mode === CARRIER_SEPARATE && choice.carrierId !== choice.predictedWishId, rejectedCarriers: choice.rejected });
@@ -1687,7 +1763,7 @@
       conditionSourceText, cleanupAutoRecord, cleanupChatResidues, injectAutoOoc, markerPattern, fitBundleForCarrier, loadResidues, diagnostics: autoDiagnostics, hookInfo, live,
       composeCarrier, previewTurn: (data, api) => previewTurn(check(data), api), PREVIEW_GENERATION_ID, fresh, normalizeAuto, normalizeSettings, readLibrary, generationFrame, GENERATION_MODES, GENERATION_EVENTS,
       turnOoc, refreshTurn: api => readLibrary().then(data => refreshTurn(data, api)), scheduleTurn, setTurnOverride, turnChecklist, peekTurnPlan, takeTurnPlan, toastLog, situationCacheKey, TURN_DEBOUNCE_MS, watchTurnPage,
-      modelOptions, legacyModelKey, refreshModelCatalog, currentModelContext, visibleAssistantText,
+      modelOptions, legacyModelKey, refreshModelCatalog, currentModelContext, visibleAssistantText, modelKeysOf, detectedModels, detectedModelForChat, rememberDetectedModel,
       parseFirebaseAppConfig, normalizeSituationSettings, saveSituationSettings, judgeSituations, parseMatchedIds, pendingSituations: (data, request) => pendingSituations(check(data), request),
       testSituationApi, situationPrompt, diagnosticsText, SITUATION_MODELS, SITUATION_CONTEXT_MESSAGES, SITUATION_TIMEOUT_MS,
     } });
