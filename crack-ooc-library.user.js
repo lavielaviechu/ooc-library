@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Crack OOC 보관함
 // @namespace    crack.ooc.library
-// @version      3.0.3.0
+// @version      3.0.3.1
 // @description  OOC를 보관하고 안전한 assistant carrier에 독립적으로 자동 컨텍스트를 주입 (version 관리방식: 데이터구조버전.크랙UI변경.기능추가및수정.버그수정)
 // @match        https://crack.wrtn.ai/*
 // @noframes
@@ -358,6 +358,7 @@
     flame: '<path d="M12 2c1 5 6 6 6 11a6 6 0 0 1-12 0c0-3 2-5 3-7 0 3 1 4 2 4 2-2 2-5 1-8Z"/><path d="M12 12c-2 2-3 3-3 5a3 3 0 0 0 6 0c0-2-2-3-3-5Z"/>',
     search: '<circle cx="10.5" cy="10.5" r="6.5"/><path d="m16 16 5 5"/>',
     chevron: '<path d="m9 5 7 7-7 7"/>',
+    checklist: '<path d="M10.5 6H20M10.5 12H20M10.5 18H20M4 6l1.4 1.4L8 4.8M4 12l1.4 1.4L8 10.8M4 18l1.4 1.4L8 16.8"/>',
     help: '<circle cx="12" cy="12" r="9"/><path d="M9 9a3 3 0 0 1 6 0c0 2-3 2-3 4M12 17h.01"/>',
     copy: '<rect x="8" y="8" width="12" height="13" rx="2"/><path d="M16 8V3H3v13h5"/>'
   };
@@ -454,22 +455,22 @@
     modelCatalogForcedAt = now;
     await refreshModelCatalog(signal, true).catch(() => []);
   }
-  // dropdown용 목록 하나. 어느 서비스(스토리·캐릭터·파티챗)의 모델인지는 표시하지 않고, key(crackerModel)가 같은 행은 하나로 합친다.
-  // 이름까지 같은 다른 key가 있으면 한 줄만 고를 수 있게 한다 (모델 조건은 key와 이름 둘 다로 비교하므로 어느 쪽 모델이든 맞는다).
-  // selectable은 지금 Crack에서 고를 수 있는 유료 모델이다: 판매 종료(retired)와 무료(free) 행만 남은 모델은 빠진다.
+  // 모델 조건 dropdown에 내놓지 않는 key. 캐릭터 채팅의 Pro(proMode)는 스토리 쪽 모델들과 key가 다른 별개의 모델이다.
+  // 이름이 비슷한 다른 모델과 합치지 않고 고르는 목록에서만 뺀다 (이미 저장된 proMode 조건은 그대로 proMode로 비교한다).
+  const HIDDEN_MODEL_KEYS = ['proMode'];
+  // dropdown용 목록 하나. key(crackerModel)가 같은 행만 하나로 합친다 (같은 모델이 여러 서비스에 나오거나 가격별 _id가 여럿인 경우).
+  // key가 다르면 이름이 같아도 다른 모델이다. 합치지 않으며, 고를 수 있는 것끼리 이름이 겹치면 key를 덧붙여 구분한다.
+  // selectable은 지금 Crack에서 고를 수 있는 유료 모델이다: 판매 종료(retired)·무료(free) 행만 남은 모델과 숨기기로 한 key는 빠진다.
   function modelOptions() {
-    const byKey = new Map(), names = new Set();
+    const byKey = new Map();
     for (const service of MODEL_SERVICES) for (const row of modelCatalog.filter(item => item.service === service)) {
-      const live = !row.retired && !row.free, known = byKey.get(row.key);
+      const live = !row.retired && !row.free && !HIDDEN_MODEL_KEYS.includes(row.key), known = byKey.get(row.key);
       if (!known) byKey.set(row.key, { key: row.key, name: row.name, label: row.name, retired: row.retired, free: !!row.free, selectable: live });
       else if (!known.selectable && live) Object.assign(known, { name: row.name, label: row.name, retired: false, free: false, selectable: true });
     }
-    for (const option of byKey.values()) {
-      if (!option.selectable) continue;
-      const name = modelText(option.name);
-      if (names.has(name)) Object.assign(option, { selectable: false, alias: true }); else names.add(name);
-    }
-    return [...byKey.values()];
+    const options = [...byKey.values()], sameName = option => options.filter(other => other.selectable && other.name === option.name).length > 1;
+    for (const option of options) if (option.selectable && sameName(option)) option.label = `${option.name} (${option.key})`;
+    return options;
   }
   // 2.0.2.x에서 직접 입력한 모델 문자열 하나가 현재 목록의 모델과 정확히 맞으면 그 key를 돌려준다.
   function legacyModelKey(value) {
@@ -494,17 +495,25 @@
     const values = modelValues(model);
     return modelCatalog.some(row => [row.id, row.key, row.name].some(item => values.includes(modelText(item))));
   }
-  function ruleModelValues(condition) {
-    const key = modelText(condition.modelKey), rows = modelCatalog.filter(row => modelText(row.key) === key);
-    return [...new Set([key, modelText(condition.modelName), ...rows.flatMap(row => [modelText(row.id), modelText(row.name)])].filter(Boolean))];
+  // 지금 쓰는 모델의 key(crackerModel). 방 정보나 메시지에서 key 또는 chatModelId를 얻었으면 그것으로 정한다. 화면의 이름밖에 모를 때는
+  // 그 이름을 가진 key가 목록에 하나뿐일 때만 그 key로 본다. 이름이 같은 다른 모델이 있으면 어느 쪽인지 알 수 없으므로 정하지 않는다.
+  function modelKeysOf(model) {
+    const source = resolveModel(model), direct = modelText(source.crackerModel);
+    if (direct) return [direct];
+    const names = [source.name, source.label, source.model].map(modelText).filter(Boolean);
+    const keys = [...new Set(modelCatalog.filter(row => names.includes(modelText(row.name)) || names.includes(modelText(row.key))).map(row => modelText(row.key)))];
+    return keys.length === 1 ? keys : [];
   }
   // 상황 조건 문구를 비교·중복 제거할 때 쓰는 열쇠. 같은 문구를 여러 OOC가 쓰면 API에는 한 번만 묻고 결과를 함께 쓴다.
   const situationKey = text => String(text ?? '').normalize('NFKC').replace(/\s+/g, ' ').trim().toLocaleLowerCase();
   function conditionHolds(condition, request) {
     const value = condition.value;
     if (condition.type === 'model') {
-      // 모델을 확인하지 못한 턴에는 actual이 비어 모델 조건이 든 OOC만 빠진다.
-      const actual = modelValues(request.model), wanted = condition.modelKey ? ruleModelValues(condition) : splitValues(value).map(modelText);
+      // 목록에서 고른 조건(modelKey)은 key끼리만 비교한다. 이름이 같거나 비슷해도 key가 다르면 다른 모델이다.
+      // 모델을 확인하지 못한 턴에는 비교할 key가 없어 모델 조건이 든 OOC만 빠진다.
+      if (condition.modelKey) return modelKeysOf(request.model).includes(modelText(condition.modelKey));
+      // 2.0.2.x에서 직접 입력한 문자열은 예전처럼 key·id·이름 가운데 어느 것과든 같으면 맞는다.
+      const actual = modelValues(request.model), wanted = splitValues(value).map(modelText);
       return wanted.length > 0 && wanted.some(item => actual.includes(item));
     }
     if (condition.type === 'assistantLength') {
@@ -1238,7 +1247,6 @@
   const turnOoc = { chatId: '', draft: '', overrides: new Map(), situations: new Map(), key: '', status: 'idle', info: null, message: '', pending: null, abort: null,
     context: null, view: null, timer: null, run: 0, generatingAt: 0, toasted: '', errorShown: false, watching: false, open: false, seenRaw: null, modelLabel: null };
   const toastLog = [];
-  let turnUi = null;
   const composerEditor = () => document.querySelector('.__chat_input_textarea[contenteditable="true"]');
   const composerText = () => { const editor = composerEditor(); return conditionSourceText(editor?.innerText ?? editor?.textContent ?? ''); };
   // 지금 화면에서 다음에 일어날 generation. 서버의 마지막이 답 없는 USER이고 입력창이 비어 있으면 그 USER에 답하는 "이어서 생성"이고
@@ -1377,66 +1385,60 @@
     if (signature && signature !== turnOoc.toasted) showToast(`자동 OOC · 상황 감지\n「${picked[0].name}」${picked.length > 1 ? ` 외 ${picked.length - 1}개` : ''} 선택`);
     turnOoc.toasted = signature;
   }
-  // ---- 이번 턴 OOC 화면: 입력 상자 바로 위의 작은 버튼과, 누르면 펼쳐지는 체크리스트 ----
-  // Crack의 화면 구조에 끼워 넣지 않고 입력 상자 위치에 맞춰 띄운다 (Crack이 화면을 다시 그려도 사라지지 않고, 입력 영역을 밀어내지 않는다).
-  function turnAnchor() {
-    const editor = composerEditor(); if (!editor?.getBoundingClientRect) return null;
-    // 둥근 테두리의 입력 상자(편집기를 감싼 가까운 조상)가 있으면 그 위에 맞춘다.
-    let box = editor, parent = editor.parentElement;
-    for (let depth = 0; parent && depth < 5; depth++, parent = parent.parentElement) {
-      const rect = parent.getBoundingClientRect();
-      if (rect.height > 320 || rect.width > innerWidth) break;
-      if (parseFloat(getComputedStyle(parent).borderTopLeftRadius) > 0) box = parent;
-    }
-    const rect = box.getBoundingClientRect();
-    return rect.width && rect.height ? rect : null;
-  }
-  function placeTurnUi() {
-    if (!turnUi || turnUi.root.hidden) return;
-    const rect = turnAnchor(); if (!rect) { turnUi.root.hidden = true; return; }
-    turnUi.root.style.right = `${Math.max(8, innerWidth - rect.right)}px`; turnUi.root.style.bottom = `${Math.max(8, innerHeight - rect.top + 6)}px`;
-  }
-  function ensureTurnUi() {
-    if (turnUi?.root.isConnected) return turnUi;
-    const root = node('div', 'oa-turn'), chip = node('button', 'oa-turn-chip'), list = node('div', 'oa-turn-list');
-    chip.type = 'button'; list.hidden = true; list.setAttribute('role', 'group'); list.setAttribute('aria-label', '이번 턴 OOC');
+  // ---- 이번 턴 OOC 화면: OOC 보관함 탭 안, 목록 영역의 오른쪽 아래에 있는 작은 버튼과 그 위로 펼쳐지는 체크리스트 ----
+  // 버튼은 OOC 보관함 목록을 그리는 이 스크립트의 container(panel.body) 안에 들어 있다. 그래서 OOC 보관함 탭이 열려 있을 때만 보이고,
+  // 다른 탭으로 가거나 Crack이 그 영역을 지우면 함께 사라진다. 위치는 그 container의 오른쪽 아래로 CSS가 정한다 (화면 좌표를 계산하지 않는다).
+  // 입력을 살피고 상황 판정을 미리 받아 두는 일은 이 화면과 무관하게 계속 돈다. 탭을 열면 그때의 turnOoc가 그대로 보인다.
+  function buildTurnUi() {
+    const root = node('div', 'oa-turn'), list = node('div', 'oa-turn-list'), badge = node('span', 'oa-turn-badge');
+    const button = action('이번 턴 OOC', () => { turnOoc.open = !turnOoc.open; drawTurn(); }, 'checklist', 'oa-turn-button');
+    list.hidden = true; list.setAttribute('role', 'group'); list.setAttribute('aria-label', '이번 턴 OOC 목록'); badge.setAttribute('aria-hidden', 'true'); button.append(badge);
     // 눌러도 입력창의 포커스와 커서는 그대로 둔다.
     root.addEventListener('pointerdown', event => event.preventDefault());
-    chip.addEventListener('click', () => { turnOoc.open = !turnOoc.open; drawTurn(); });
     list.addEventListener('change', event => { const id = event.target?.dataset?.oaEntry; if (id) setTurnOverride(id, event.target.checked); });
-    root.append(list, chip); document.body.append(root);
-    return turnUi = { root, chip, list };
+    root.append(list, button);
+    return { root, button, list, badge };
   }
   function drawTurn() {
     if (!turnOoc.watching) return;
     const state = turnChecklist();
-    if (!state || !state.rows.length || !turnAnchor()) { if (turnUi) turnUi.root.hidden = true; return; }
-    const ui = ensureTurnUi(), scroll = ui.list.scrollTop;
-    const status = state.status === 'pending' ? '판정 중…' : state.status === 'error' ? (state.error === 'off' ? '상황 감지 꺼짐' : '상황 감지 실패') : '';
-    // 체크한 것이 글자수 한도 때문에 다 들어가지 못하면 둘 다 보여 준다.
-    ui.chip.textContent = ['이번 턴 OOC', state.checked > state.injected ? `선택 ${state.checked} · 주입 ${state.injected}` : String(state.injected), status].filter(Boolean).join(' · ');
-    ui.chip.setAttribute('aria-expanded', String(turnOoc.open)); ui.list.hidden = !turnOoc.open;
-    if (turnOoc.open) {
-      const foot = node('div', 'oa-turn-foot'), manual = state.rows.filter(row => row.manual).length;
+    for (const panel of attached.values()) {
+      const ui = panel.turn; if (!ui) continue;
+      // 자동주입을 켠 OOC가 없거나 채팅방이 아니면 버튼을 두지 않는다.
+      ui.root.hidden = !state || !state.rows.length;
+      if (ui.root.hidden || !panel.active) continue;
+      const status = state.status === 'pending' ? '판정 중…' : state.status === 'error' ? (state.error === 'off' ? '상황 감지 꺼짐' : '상황 감지 실패') : '';
+      // 체크한 것이 글자수 한도 때문에 다 들어가지 못하면 둘 다 보여 준다.
+      const summary = ['이번 턴 OOC', state.checked > state.injected ? `선택 ${state.checked} · 주입 ${state.injected}` : `${state.injected}개`, status].filter(Boolean).join(' · ');
+      ui.button.title = summary; ui.button.setAttribute('aria-expanded', String(turnOoc.open));
+      ui.badge.textContent = state.status === 'pending' ? '…' : String(state.injected); ui.badge.classList.toggle('oa-turn-alert', state.status === 'error' && state.error !== 'off');
+      ui.list.hidden = !turnOoc.open;
+      if (!turnOoc.open) continue;
+      const scroll = ui.list.scrollTop, foot = node('div', 'oa-turn-foot'), manual = state.rows.filter(row => row.manual).length;
       foot.append(node('span', '', manual ? `직접 바꾼 ${manual}개는 이번 턴에만 적용됩니다.` : '체크한 OOC가 다음 생성에 들어갑니다.'));
       if (manual) { const undo = node('button', '', '자동으로'); undo.type = 'button'; undo.title = '직접 바꾼 선택을 지우고 자동 판정으로 돌아갑니다'; undo.addEventListener('click', () => { turnOoc.overrides.clear(); drawTurn(); }); foot.append(undo); }
-      ui.list.replaceChildren(node('div', 'oa-turn-head', '이번 턴 OOC'), ...state.rows.map(row => {
+      ui.list.replaceChildren(node('div', 'oa-turn-head', summary), ...state.rows.map(row => {
         const label = node('label', `oa-turn-row${row.manual ? ' oa-turn-manual' : ''}`), box = node('input'); box.type = 'checkbox'; box.checked = row.checked; box.dataset.oaEntry = row.id;
         label.append(box, node('span', 'oa-turn-name', row.name), node('small', '', row.note)); return label;
       }), foot);
       ui.list.scrollTop = scroll;
     }
-    ui.root.hidden = false; placeTurnUi();
+  }
+  // 알림은 입력 상자 바로 위에 잠깐 뜬다 (OOC 보관함 탭을 닫아 두었어도 보여야 한다).
+  function toastAnchor() {
+    const editor = composerEditor(); if (!editor?.getBoundingClientRect) return null;
+    const rect = editor.getBoundingClientRect();
+    return rect.width && rect.height ? rect : null;
   }
   function showToast(text) {
     toastLog.push(text); while (toastLog.length > 20) toastLog.shift();
     if (!turnOoc.watching) return;
     document.querySelectorAll('.oa-toast').forEach(element => element.remove());
-    const toast = node('div', 'oa-toast', text), rect = turnAnchor(); toast.setAttribute('role', 'status');
-    toast.style.right = `${Math.max(8, rect ? innerWidth - rect.right : 8)}px`; toast.style.bottom = `${Math.max(8, rect ? innerHeight - rect.top + 40 : 8)}px`;
+    const toast = node('div', 'oa-toast', text), rect = toastAnchor(); toast.setAttribute('role', 'status');
+    toast.style.right = `${Math.max(8, rect ? innerWidth - rect.right : 8)}px`; toast.style.bottom = `${Math.max(8, rect ? innerHeight - rect.top + 12 : 8)}px`;
     document.body.append(toast); setTimeout(() => toast.remove(), 3200);
   }
-  // 화면에서 바뀐 것을 가볍게 살핀다: 방, 모델 선택, 입력창의 글(편집기가 input 이벤트 없이 글을 바꾸는 경우 포함), 입력 상자의 위치.
+  // 화면에서 바뀐 것을 가볍게 살핀다: 방, 모델 선택, 입력창의 글(편집기가 input 이벤트 없이 글을 바꾸는 경우 포함).
   function watchTurnPage() {
     const chatId = currentChatId(), raw = composerEditor()?.textContent ?? '', label = semanticModelLabel();
     if (chatId !== turnOoc.chatId) { resetTurn(chatId); turnOoc.seenRaw = raw; turnOoc.modelLabel = label; drawTurn(); scheduleTurn('chat', 300); return; }
@@ -1444,14 +1446,12 @@
     // 모델+상황 조건처럼 물어볼 문구 자체가 달라지면 상황 판정도 새로 받는다. 직접 바꾼 선택은 건드리지 않는다.
     if (label !== turnOoc.modelLabel) { const first = turnOoc.modelLabel === null; turnOoc.modelLabel = label; if (!first) { turnOoc.context = null; scheduleTurn('model'); } }
     if (raw !== turnOoc.seenRaw) { turnOoc.seenRaw = raw; scheduleTurn('draft'); }
-    if (turnUi && !turnUi.root.hidden) placeTurnUi(); else if (turnOoc.view && turnAnchor()) drawTurn();
   }
   function startTurnUi() {
     turnOoc.watching = true;
-    // 입력창의 글이 바뀌면 잠시 뒤(입력이 멈춘 뒤) 한 번 다시 계산한다.
+    // 입력창의 글이 바뀌면 잠시 뒤(입력이 멈춘 뒤) 한 번 다시 계산한다. OOC 보관함 탭이 열려 있는지와 무관하다.
     for (const type of ['input', 'compositionend', 'paste', 'cut']) document.addEventListener(type, event => { if (event.target?.closest?.('.__chat_input_textarea')) { turnOoc.seenRaw = composerEditor()?.textContent ?? ''; scheduleTurn(type); } }, true);
-    document.addEventListener('pointerdown', event => { if (turnOoc.open && turnUi && !turnUi.root.contains(event.target)) { turnOoc.open = false; drawTurn(); } }, true);
-    W.addEventListener?.('resize', placeTurnUi);
+    document.addEventListener('pointerdown', event => { if (turnOoc.open && ![...attached.values()].some(panel => panel.turn?.root.contains(event.target))) { turnOoc.open = false; drawTurn(); } }, true);
     setInterval(watchTurnPage, 700);
     scheduleTurn('start', 300);
   }
@@ -1832,8 +1832,8 @@
       if (!row.modelKey && row.value) { const found = legacyModelKey(row.value); if (found) Object.assign(row, { modelKey: found, modelName: modelOptions().find(option => option.key === found)?.name || '', value: '' }); }
       const select = labelled(node('select'), label), options = modelOptions(), chosen = row.modelKey || (row.value ? LEGACY_MODEL_OPTION : '');
       select.append(new Option(options.length ? '모델 선택' : modelCatalogLoading ? '모델 목록을 불러오는 중…' : '모델 목록을 불러오지 못했습니다', ''));
-      // 지금 Crack에서 고를 수 있는 유료 모델만 이름 하나씩 보여 준다. 이미 저장돼 있던 값이 종료·무료 모델이거나 같은 이름의 다른 key면 그 항목 하나만 표시용으로 덧붙인다.
-      for (const option of options) if (option.selectable || option.key === chosen) select.append(new Option(option.selectable || option.alias ? option.label : `${option.label} (${option.retired ? '종료된 모델' : '선택 대상 아님'})`, option.key));
+      // 지금 Crack에서 고를 수 있는 유료 모델만 보여 준다. 이미 저장돼 있던 값이 종료·무료 모델이거나 목록에서 숨긴 key면 그 항목 하나만 표시용으로 덧붙인다.
+      for (const option of options) if (option.selectable || option.key === chosen) select.append(new Option(option.selectable ? option.label : `${option.label} (${option.retired ? '종료된 모델' : '선택 대상 아님'})`, option.key));
       if (chosen === LEGACY_MODEL_OPTION) select.append(new Option(`기존 입력값 유지: ${row.value}`, LEGACY_MODEL_OPTION));
       else if (chosen && !options.some(option => option.key === chosen)) select.append(new Option(`${row.modelName || chosen} (현재 목록에 없음)`, chosen));
       select.value = chosen;
@@ -2159,12 +2159,12 @@
     bookmark();
   }
   function drawPanel(panel) {
-    panel.body.replaceChildren(); if (!library) return;
+    panel.list.replaceChildren(); if (!library) return;
     const ooc = item => { const button = action(item.name, () => useOoc(item.content), null, 'oa-use'); button.addEventListener('pointerdown', event => event.preventDefault()); return button; };
     library.categories.forEach(folder => {
       const { name, items: entries } = folder, section = node('details', 'oa-list-folder'), summary = node('summary');
-      summary.innerHTML = svg('chevron') + svg('folder'); summary.append(node('span', '', name)); section.append(summary); entries.forEach(item => section.append(ooc(item))); panel.body.append(section);
-    }); library.extras.forEach(item => panel.body.append(ooc(item)));
+      summary.innerHTML = svg('chevron') + svg('folder'); summary.append(node('span', '', name)); section.append(summary); entries.forEach(item => section.append(ooc(item))); panel.list.append(section);
+    }); library.extras.forEach(item => panel.list.append(ooc(item)));
   }
   function drawPanels() { attached.forEach(panel => { if (panel.active) drawPanel(panel); }); }
   // OOC 탭의 글자 굵기·색은 값을 따로 정하지 않고 Crack 기본 탭의 실제 계산값(선택됨/선택 안 됨)을 그대로 쓴다.
@@ -2189,6 +2189,9 @@
   function panelMode(panel, enabled) {
     panel.active = enabled; panel.body.hidden = !enabled; panel.native.forEach(element => { element.classList.toggle('oa-native-hidden', enabled); }); panel.button.classList.toggle('oa-tab-active', enabled); panel.button.setAttribute('aria-pressed', String(enabled));
     try { syncTabStyle(panel); } catch { /* 기본 굵기(일반/선택 시 굵게)로 표시된다. */ }
+    // 이번 턴 OOC 버튼은 이 탭 안에 있다. 탭을 열면 지금 상태를 그리고, 닫으면 펼쳐 둔 체크리스트도 닫는다.
+    if (!enabled) turnOoc.open = false;
+    drawTurn();
   }
   function discover() {
     for (const [root, panel] of attached) if (!root.isConnected || !panel.button.isConnected) {
@@ -2198,7 +2201,9 @@
       const hub = Array.from(tabs.querySelectorAll('[role="tab"]')).find(tab => tab.textContent.trim() === '단축어 허브'); if (!hub) return;
       const root = tabs.parentElement.parentElement; if (attached.has(root)) return;
       const native = Array.from(root.children).slice(1); if (!native.some(element => element.querySelector('ul'))) return;
-      const panel = { native, tabs, body: node('div', 'oa-panel-body'), active: false }; panel.body.hidden = true; panel.body.setAttribute('aria-label', 'OOC 목록');
+      // body: OOC 보관함 탭의 내용 영역 전체. 그 안에 스크롤되는 목록(list)과, 오른쪽 아래에 고정되는 이번 턴 OOC 버튼(turn)이 들어간다.
+      const panel = { native, tabs, body: node('div', 'oa-panel-body'), list: node('div', 'oa-panel-list'), turn: buildTurnUi(), active: false }; panel.body.hidden = true; panel.list.setAttribute('aria-label', 'OOC 목록');
+      panel.body.append(panel.list, panel.turn.root);
       panel.button = action('OOC 보관함', async () => {
         bookmark(); await readLibrary(); panelMode(panel, true); drawPanel(panel);
       }, null, 'oa-tab'); panel.button.addEventListener('pointerdown', event => { bookmark(); event.preventDefault(); });
@@ -2218,7 +2223,7 @@
     const panel = Array.from(attached.values()).find(panel => panel.active && panel.body.isConnected);
     if (!panel || event.isComposing || !event.target.closest?.('.__chat_input_textarea') || !['Enter', 'ArrowDown', 'ArrowUp'].includes(event.key)) return;
     event.preventDefault(); event.stopImmediatePropagation();
-    if (event.key !== 'Enter') panel.body.querySelector('summary,button')?.focus();
+    if (event.key !== 'Enter') panel.list.querySelector('summary,button')?.focus();
   }, true);
 
   void readLibrary().catch(error => console.warn('[Crack OOC 보관함] 자동주입 자료를 미리 읽지 못했습니다.', error));
@@ -2229,10 +2234,10 @@
     .oa-dialog [hidden]{display:none!important}.oa-dialog::backdrop{background:#0007}.oa-dialog.oa-large{width:min(680px,calc(100vw - 32px))}.oa-dialog.oa-guide{width:min(620px,calc(100vw - 32px))}.oa-header{display:flex;align-items:center;gap:8px;height:64px;padding:0 20px;border-bottom:1px solid var(--oa-line)}.oa-header strong{font-size:16px;font-weight:650}.oa-header>.oa-icon{margin-left:auto}.oa-actions{display:flex;gap:4px;margin-left:auto}.oa-dot{width:7px;height:7px;background:#f06b73;border-radius:50%}.oa-body{padding:20px;overflow:auto;max-height:calc(86vh - 142px)}.oa-large .oa-body{min-height:260px;max-height:calc(86vh - 66px)}.oa-footer{display:flex;justify-content:flex-end;gap:8px;padding:12px 20px;border-top:1px solid var(--oa-line)}
     .oa-dialog button{font:inherit;cursor:pointer}.oa-icon{display:inline-flex;align-items:center;justify-content:center;width:32px;height:32px;padding:6px;border:0;border-radius:6px;background:transparent;color:var(--oa-muted,currentColor);flex-shrink:0}.oa-icon svg, .oa-symbol svg,.oa-search svg,.oa-toggle svg,.oa-list-folder svg{width:20px;height:20px;display:block;flex-shrink:0}.oa-icon:hover,.oa-toggle:hover{background:#8882;color:var(--oa-fg,inherit)}.oa-dialog button:disabled{opacity:.35;cursor:default}.oa-dialog button:focus-visible,.oa-dialog summary:focus-visible{outline:2px solid var(--oa-accent);outline-offset:2px}.oa-button{border:1px solid var(--oa-line);background:transparent;color:inherit;border-radius:8px;padding:7px 14px}.oa-primary{background:var(--oa-accent);color:#171724;border-color:transparent}.oa-toolbar{display:flex;align-items:center;gap:6px;margin-bottom:14px}.oa-search{display:flex;align-items:center;gap:8px;flex:1;border:1px solid var(--oa-line);border-radius:8px;padding:0 10px;color:var(--oa-muted)}
     .oa-dialog input,.oa-dialog textarea,.oa-dialog select{color:inherit;background:transparent;border:1px solid var(--oa-line);border-radius:8px;padding:9px 10px;font:inherit;width:100%;box-sizing:border-box;min-width:0}.oa-search input{border:0;outline:none;padding:9px 0}.oa-field{display:flex;flex-direction:column;gap:7px;margin-bottom:16px}.oa-field>span{font-size:13px;color:var(--oa-muted)}.oa-dialog textarea{resize:vertical;white-space:pre-wrap}.oa-dialog select option{color:#eee;background:#222}.oa-toggle-field{display:grid;grid-template-columns:auto 1fr;gap:4px 9px;align-items:center;margin:0 0 16px}.oa-toggle-field input{width:18px;height:18px}.oa-toggle-field small{grid-column:2;color:var(--oa-muted);line-height:1.45}.oa-hint{margin:-8px 0 14px;color:var(--oa-muted);font-size:12px;line-height:1.5}.oa-auto-editor,.oa-settings-section{border-top:1px solid var(--oa-line);padding-top:16px;margin-top:4px}.oa-settings-section{border:1px solid var(--oa-line);border-radius:10px;padding:14px;margin-bottom:22px}.oa-preview{margin-top:12px;padding:10px;border-radius:8px;background:#8881}.oa-preview strong{display:block;margin-bottom:6px}.oa-preview-list{white-space:pre-wrap}.oa-preview-list small{display:block;color:var(--oa-muted);margin-top:6px}.oa-muted{color:var(--oa-muted)}.oa-conditions-title{margin:4px 0 10px;font-size:13px;color:var(--oa-muted);font-weight:600}.oa-condition{border:1px solid var(--oa-line);border-radius:10px;padding:10px;margin-bottom:10px}.oa-condition-head{display:flex;align-items:center;gap:8px}.oa-condition-head select{flex:1}.oa-condition-number{color:var(--oa-muted);min-width:18px}.oa-condition-detail{display:flex;flex-direction:column;gap:8px;margin-top:8px}.oa-condition-detail small{color:var(--oa-muted);font-size:12px;line-height:1.5}.oa-condition-detail small.oa-condition-warning{color:#ed969e}.oa-conditions-note{margin:12px 0 0}.oa-api-fields{margin-top:4px}.oa-settings-section .oa-button-row{margin-top:4px;flex-wrap:wrap}.oa-raw{margin-top:10px}.oa-raw summary{cursor:pointer;font-size:13px}.oa-raw-stats{margin:8px 0;color:var(--oa-muted);font-size:12px;line-height:1.5}.oa-dialog textarea.oa-raw-text{font:12px/1.5 ui-monospace,SFMono-Regular,Consolas,monospace;white-space:pre-wrap;overflow-wrap:anywhere;max-height:320px;overflow:auto}.oa-raw .oa-button-row{align-items:center;margin-top:8px}
-    .oa-turn,.oa-toast{--oa-bg:hsl(var(--card,0 0% 9%));--oa-fg:hsl(var(--foreground,0 0% 98%));--oa-muted:hsl(var(--muted-foreground,0 0% 58%));--oa-line:hsl(var(--border,0 0% 22%));--oa-accent:#a5a0f5;position:fixed;z-index:20;font:12px/1.4 system-ui;color:var(--oa-fg)}.oa-turn[hidden],.oa-turn [hidden]{display:none!important}.oa-turn{display:flex;flex-direction:column;align-items:flex-end;gap:6px;max-width:calc(100vw - 16px)}.oa-turn-chip{border:1px solid var(--oa-line);background:var(--oa-bg);color:var(--oa-muted);border-radius:999px;padding:3px 10px;font:inherit;cursor:pointer;white-space:nowrap;max-width:100%;overflow:hidden;text-overflow:ellipsis}.oa-turn-chip[aria-expanded="true"]{color:var(--oa-fg);border-color:var(--oa-accent)}.oa-turn-chip:focus-visible{outline:2px solid var(--oa-accent);outline-offset:2px}.oa-turn-list{width:min(300px,calc(100vw - 16px));max-height:min(45vh,340px);overflow:auto;background:var(--oa-bg);border:1px solid var(--oa-line);border-radius:12px;padding:8px;box-shadow:0 12px 40px #0007;box-sizing:border-box}.oa-turn-head{font-weight:600;font-size:13px;margin:2px 4px 6px}.oa-turn-row{display:grid;grid-template-columns:auto minmax(0,1fr) auto;align-items:center;gap:8px;padding:6px 4px;border-radius:6px;cursor:pointer}.oa-turn-row:hover{background:#8882}.oa-turn-row input{width:16px;height:16px;margin:0;accent-color:var(--oa-accent)}.oa-turn-name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:13px}.oa-turn-row small{color:var(--oa-muted);white-space:nowrap}.oa-turn-manual small{color:var(--oa-accent)}.oa-turn-foot{display:flex;align-items:center;justify-content:space-between;gap:8px;margin:8px 4px 2px;color:var(--oa-muted)}.oa-turn-foot button{border:1px solid var(--oa-line);background:transparent;color:inherit;border-radius:6px;padding:2px 8px;font:inherit;cursor:pointer;white-space:nowrap}.oa-toast{background:var(--oa-bg);border:1px solid var(--oa-line);border-radius:10px;padding:8px 12px;white-space:pre-line;box-shadow:0 8px 24px #0006;max-width:min(280px,calc(100vw - 16px));pointer-events:none}.oa-diagnostics{margin-top:12px}.oa-diagnostics summary{cursor:pointer;color:var(--oa-muted);font-size:12px}.oa-diagnostics pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#8881;border-radius:6px;padding:10px;margin:8px 0 0;font-size:11px;max-height:240px;overflow:auto}
+    .oa-turn,.oa-toast{--oa-bg:hsl(var(--card,0 0% 9%));--oa-fg:hsl(var(--foreground,0 0% 98%));--oa-muted:hsl(var(--muted-foreground,0 0% 58%));--oa-line:hsl(var(--border,0 0% 22%));--oa-accent:#a5a0f5;font:12px/1.4 system-ui;color:var(--oa-fg)}.oa-turn{position:absolute;right:14px;bottom:14px;z-index:1;display:flex;flex-direction:column;align-items:flex-end;gap:8px;max-width:calc(100% - 28px);max-height:calc(100% - 22px);box-sizing:border-box;pointer-events:none}.oa-turn>*{pointer-events:auto}.oa-turn[hidden],.oa-turn [hidden]{display:none!important}.oa-turn-button.oa-icon{position:relative;width:34px;height:34px;border:1px solid var(--oa-line);border-radius:10px;background:var(--oa-bg);color:var(--oa-muted);box-shadow:0 2px 8px #0003}.oa-turn-button.oa-icon:hover,.oa-turn-button[aria-expanded="true"]{background:var(--oa-bg);color:var(--oa-fg);border-color:var(--oa-accent)}.oa-turn-button:focus-visible{outline:2px solid var(--oa-accent);outline-offset:2px}.oa-turn-badge{position:absolute;top:-6px;right:-6px;min-width:16px;height:16px;padding:0 4px;border-radius:8px;background:var(--oa-accent);color:#171724;font:600 10px/16px system-ui;text-align:center;box-sizing:border-box;pointer-events:none}.oa-turn-badge.oa-turn-alert{background:#ed969e}.oa-turn-list{flex:0 1 auto;min-height:0;width:300px;max-width:100%;overflow:auto;background:var(--oa-bg);border:1px solid var(--oa-line);border-radius:12px;padding:8px;box-shadow:0 12px 40px #0007;box-sizing:border-box}.oa-turn-head{font-weight:600;font-size:13px;margin:2px 4px 6px}.oa-turn-row{display:grid;grid-template-columns:auto minmax(0,1fr) auto;align-items:center;gap:8px;padding:6px 4px;border-radius:6px;cursor:pointer}.oa-turn-row:hover{background:#8882}.oa-turn-row input{width:16px;height:16px;margin:0;accent-color:var(--oa-accent)}.oa-turn-name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:13px}.oa-turn-row small{color:var(--oa-muted);white-space:nowrap}.oa-turn-manual small{color:var(--oa-accent)}.oa-turn-foot{display:flex;align-items:center;justify-content:space-between;gap:8px;margin:8px 4px 2px;color:var(--oa-muted)}.oa-turn-foot button{border:1px solid var(--oa-line);background:transparent;color:inherit;border-radius:6px;padding:2px 8px;font:inherit;cursor:pointer;white-space:nowrap}.oa-toast{position:fixed;z-index:20;background:var(--oa-bg);border:1px solid var(--oa-line);border-radius:10px;padding:8px 12px;white-space:pre-line;box-shadow:0 8px 24px #0006;max-width:min(280px,calc(100vw - 16px));pointer-events:none}.oa-diagnostics{margin-top:12px}.oa-diagnostics summary{cursor:pointer;color:var(--oa-muted);font-size:12px}.oa-diagnostics pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#8881;border-radius:6px;padding:10px;margin:8px 0 0;font-size:11px;max-height:240px;overflow:auto}
     .oa-group{margin:8px 0;border:1px solid var(--oa-line);border-radius:10px;overflow:visible}.oa-group>.oa-row{background:#8881;border-radius:9px}.oa-row{position:relative;display:flex;align-items:center;gap:9px;min-height:44px;padding:4px 8px;box-sizing:border-box}.oa-name{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.oa-group>.oa-row>.oa-name{font-weight:600;cursor:pointer}.oa-symbol{color:var(--oa-muted);flex-shrink:0}.oa-group>.oa-row>.oa-symbol{color:#c4b391}.oa-count{color:var(--oa-muted);font-size:12px}.oa-auto-badge{font-size:11px;color:#b9b5ff;border:1px solid #a5a0f555;border-radius:999px;padding:1px 6px;white-space:nowrap}.oa-review-badge{color:#ed969e;border-color:#eb6b7466}.oa-row-actions{display:flex;gap:2px}.oa-row-actions .oa-icon{width:28px;height:28px;padding:5px}.oa-row-actions .oa-icon[data-sort]{cursor:grab;touch-action:none}.oa-toggle{width:20px;height:28px;border:0;padding:0;background:transparent;color:var(--oa-muted);flex-shrink:0}.oa-toggle svg{width:16px;height:16px;transition:transform .15s}.oa-open .oa-toggle svg{transform:rotate(90deg)}.oa-children{margin:0 12px 10px 30px;padding-left:8px;border-left:2px solid var(--oa-line)}.oa-children .oa-row+.oa-row{border-top:1px solid #8882}.oa-extras{margin-top:14px}.oa-extras>.oa-row{border-bottom:1px solid #8882}.oa-empty{height:28px}.oa-before::before,.oa-after::after{content:'';position:absolute;left:0;right:0;height:3px;background:var(--oa-accent);border-radius:3px;z-index:2;pointer-events:none}.oa-before::before{top:0}.oa-after::after{bottom:0}.oa-children,.oa-extras{position:relative}.oa-dragging{opacity:.3}.oa-ghost{position:fixed;pointer-events:none;z-index:3;background:var(--oa-bg);border:1px solid var(--oa-line);border-radius:8px;box-shadow:0 8px 24px #0006;opacity:.95}
     .oa-message{white-space:pre-line;margin:0 0 14px;line-height:1.7}.oa-warning{color:#ed969e;background:#eb6b7410;border:1px solid #eb6b7440;border-radius:8px;padding:12px}.oa-source-options{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin:14px 0}.oa-source{display:flex;flex-direction:column;align-items:flex-start;gap:8px;padding:14px}.oa-source span{font-size:12px;color:var(--oa-muted)}.oa-source.oa-selected{border-color:var(--oa-accent);background:#a5a0f512}.oa-button-row{display:flex;gap:8px}.oa-body h3{margin:0 0 14px;font-size:14px}.oa-db-top{display:flex;align-items:center;gap:8px;margin-bottom:16px}.oa-segment{display:flex;padding:3px;border-radius:9px;background:#8882;flex:1}.oa-segment label{flex:1;text-align:center;cursor:pointer}.oa-segment input{position:absolute;opacity:0;width:1px;height:1px}.oa-segment span{display:block;border-radius:6px;padding:7px 12px;color:var(--oa-muted)}.oa-segment input:checked+span{color:var(--oa-fg);background:var(--oa-bg);box-shadow:0 1px 4px #0003}.oa-segment input:focus-visible+span{outline:2px solid var(--oa-accent)}.oa-credentials{display:grid;grid-template-columns:minmax(0,1.2fr) minmax(0,1fr) auto;gap:8px;align-items:center}.oa-credentials .oa-button{padding:9px 12px}.oa-auth-state{font-size:12px;color:var(--oa-muted);min-height:18px;margin:10px 0 0}.oa-guide-section{border-bottom:1px solid var(--oa-line);padding:12px 0}.oa-guide-section:first-child{padding-top:0}.oa-guide-section summary{cursor:pointer;font-weight:600}.oa-guide-section ol{padding-left:23px}.oa-guide-section li{margin:8px 0;line-height:1.7}.oa-guide-section pre{white-space:pre-wrap;background:#8881;border-radius:6px;padding:10px;font-size:12px}.oa-guide-section small{color:var(--oa-muted);overflow-wrap:anywhere}
-    .oa-native-hidden{display:none!important}.oa-tabs{overflow-x:auto!important;overflow-y:hidden!important;flex-wrap:nowrap!important}.oa-tab{background:transparent;border:0;border-bottom:2px solid transparent;padding:0 8px 8px;margin-bottom:-1px;flex-shrink:0;font-size:14px;font-weight:var(--oa-tab-weight,400);color:var(--oa-tab-color,inherit);white-space:nowrap;border-radius:0}.oa-tab.oa-tab-active{border-bottom-color:currentColor;font-weight:var(--oa-tab-active-weight,600);color:var(--oa-tab-active-color,inherit)}.oa-panel-config{width:28px;height:28px;margin-bottom:6px}.oa-panel-body{min-height:0;flex:1;overflow:auto;padding:8px 16px;font-size:14px}.oa-panel-body[hidden]{display:none}.oa-use{display:block;border:0;background:transparent;color:inherit;padding:8px;width:100%;text-align:left;border-radius:6px;font-size:14px}.oa-use:hover{background:#8882}.oa-list-folder summary{display:flex;align-items:center;gap:8px;padding:8px 0;cursor:pointer;font-weight:600;list-style:none}.oa-list-folder summary::-webkit-details-marker{display:none}.oa-list-folder summary svg:first-child{width:14px;height:14px}.oa-list-folder[open] summary svg:first-child{transform:rotate(90deg)}.oa-list-folder>.oa-use{margin-left:20px;width:calc(100% - 20px);padding-left:12px;border-left:2px solid #8884;border-radius:0}
+    .oa-native-hidden{display:none!important}.oa-tabs{overflow-x:auto!important;overflow-y:hidden!important;flex-wrap:nowrap!important}.oa-tab{background:transparent;border:0;border-bottom:2px solid transparent;padding:0 8px 8px;margin-bottom:-1px;flex-shrink:0;font-size:14px;font-weight:var(--oa-tab-weight,400);color:var(--oa-tab-color,inherit);white-space:nowrap;border-radius:0}.oa-tab.oa-tab-active{border-bottom-color:currentColor;font-weight:var(--oa-tab-active-weight,600);color:var(--oa-tab-active-color,inherit)}.oa-panel-config{width:28px;height:28px;margin-bottom:6px}.oa-panel-body{position:relative;min-height:0;flex:1;display:flex;flex-direction:column;font-size:14px}.oa-panel-body[hidden]{display:none}.oa-panel-list{min-height:0;flex:1;overflow:auto;padding:8px 16px 52px}.oa-use{display:block;border:0;background:transparent;color:inherit;padding:8px;width:100%;text-align:left;border-radius:6px;font-size:14px}.oa-use:hover{background:#8882}.oa-list-folder summary{display:flex;align-items:center;gap:8px;padding:8px 0;cursor:pointer;font-weight:600;list-style:none}.oa-list-folder summary::-webkit-details-marker{display:none}.oa-list-folder summary svg:first-child{width:14px;height:14px}.oa-list-folder[open] summary svg:first-child{transform:rotate(90deg)}.oa-list-folder>.oa-use{margin-left:20px;width:calc(100% - 20px);padding-left:12px;border-left:2px solid #8884;border-radius:0}
     @media(max-width:480px){.oa-header{padding:0 12px}.oa-body{padding:14px}.oa-row-actions{gap:0}.oa-children{margin-left:22px}.oa-credentials{gap:5px}.oa-credentials input{padding:8px 6px}.oa-credentials .oa-button{padding:8px}.oa-source-options{gap:6px}.oa-source{padding:10px}}
   `; document.head.append(styles);
   let queued = false;
